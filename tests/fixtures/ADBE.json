@@ -1,0 +1,48 @@
+{
+  "symbol": "ADBE",
+  "company": "",
+  "exchange": "",
+  "generated_local": "2026-10-18 23:32:59 +1100",
+  "generated_utc": "2026-10-18T12:32:59Z",
+  "query": "",
+  "search": "no search was made (no company name)",
+  "qualification": "none",
+  "sentiment_score": null,
+  "sentiment_score_scale": "1-10",
+  "sentiment_status": "no_company_name",
+  "local_sentiment_score": null,
+  "local_sentiment_status": "not requested",
+  "scores": [
+    {
+      "role": "production",
+      "label": "Production — DeepSeek (unknown)",
+      "score": null,
+      "scale": "1-10",
+      "status": "no_company_name",
+      "basis": "no_source",
+      "as_of": "2026-10-18",
+      "reason": "no company name in Stock_Info to search for",
+      "evidence": [],
+      "note": ""
+    },
+    {
+      "role": "local",
+      "label": "Local — qwen3.8-flash-next-iq2_xs-4k",
+      "score": null,
+      "scale": "1-10",
+      "status": "not requested",
+      "basis": "",
+      "as_of": "",
+      "reason": "no company name in Stock_Info to search for",
+      "evidence": [],
+      "note": "comparison only; never priced"
+    }
+  ],
+  "comparison": "vs production: not comparable",
+  "articles": [],
+  "notes": [
+    "Local summaries and the local reading are model-generated diagnostics; they are never verified, never priced, and never stored in score_breakdown.json.",
+    "Entries the search parser discarded (no title or non-HTTP URL) are not listed.",
+    "This file is overwritten by a fresh scheduled run; same-day reuse leaves it unchanged."
+  ]
+}

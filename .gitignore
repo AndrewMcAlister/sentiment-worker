@@ -1,0 +1,13 @@
+# Runtime state and logs. None of this is published: `state/` holds the backup of
+# the live corpus and the per-symbol failure log, `logs/` the worker's own history.
+state/
+logs/
+
+# A demo run's output, not a test fixture. The fixtures the tests actually read
+# live in tests/fixtures/ and are committed.
+tests/runs/
+
+# Python.
+__pycache__/
+.pytest_cache/
+*.pyc

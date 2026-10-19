@@ -1,0 +1,230 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mctrader.local/schemas/sentiment-dump.json",
+  "title": "McTrader per-symbol sentiment file",
+  "description": "One symbol's sentiment diagnostic, as written by McTrader's services/sentiment_dump.py and updated in place by the local curation worker. additionalProperties is false at all three levels, so a file that gains a field is a file that fails its own schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "symbol",
+    "company",
+    "exchange",
+    "generated_local",
+    "generated_utc",
+    "query",
+    "search",
+    "qualification",
+    "sentiment_score",
+    "sentiment_score_scale",
+    "sentiment_status",
+    "local_sentiment_score",
+    "local_sentiment_status",
+    "scores",
+    "comparison",
+    "articles",
+    "notes"
+  ],
+  "properties": {
+    "symbol": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The ticker, and the stem of the filename."
+    },
+    "company": {
+      "type": "string",
+      "description": "The company name the search was made for."
+    },
+    "exchange": {
+      "type": "string"
+    },
+    "generated_local": {
+      "type": "string",
+      "minLength": 1,
+      "description": "When this file was generated, in local time with an offset, e.g. '2026-10-18 23:59:14 +1100'."
+    },
+    "generated_utc": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The same moment in UTC, e.g. '2026-10-18T12:59:14Z'."
+    },
+    "query": {
+      "type": "string"
+    },
+    "search": {
+      "type": "string"
+    },
+    "qualification": {
+      "type": "string"
+    },
+    "sentiment_score": {
+      "type": ["number", "null"],
+      "description": "The PRODUCTION reading (DeepSeek's search judgement). Lifted from scores[role=production].score. Null when the search formed no judgement. The curation worker never writes this field.",
+      "minimum": 1,
+      "maximum": 10
+    },
+    "sentiment_score_scale": {
+      "type": "string",
+      "const": "1-10"
+    },
+    "sentiment_status": {
+      "type": "string",
+      "description": "The production reading's outcome: 'ok', 'search_only', 'no_company_name', 'model_no_view', 'no_qualifying_news', ..."
+    },
+    "local_sentiment_score": {
+      "type": ["number", "null"],
+      "description": "The LOCAL reading, 1-10, or null while pending / no view.",
+      "minimum": 1,
+      "maximum": 10
+    },
+    "local_sentiment_status": {
+      "type": "string",
+      "description": "The local reading's outcome: 'pending', 'ok', 'no view', 'not requested', 'unavailable', 'truncated', 'skipped'."
+    },
+    "local_attempted_utc": {
+      "type": "string",
+      "description": "Optional. McTrader's own worker stamps its retry clock here; a file that carries it keeps it."
+    },
+    "search_refreshed_utc": {
+      "type": "string",
+      "description": "Optional. When the paid DeepSeek search last wrote this file, e.g. '2026-10-19T06:00:00Z'. The collector re-searches and replaces the article set when this is absent or 28 days old, so a file written before the field existed has no value here and is simply due. The curation worker never writes it."
+    },
+    "scores": {
+      "type": "array",
+      "minItems": 1,
+      "description": "The two readings side by side. Exactly one entry has role 'production' and one 'local'.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "role",
+          "label",
+          "score",
+          "scale",
+          "status",
+          "basis",
+          "as_of",
+          "reason",
+          "evidence",
+          "note"
+        ],
+        "properties": {
+          "role": {
+            "type": "string",
+            "enum": ["production", "local"]
+          },
+          "label": {
+            "type": "string",
+            "description": "Names the model that produced the reading, e.g. 'Local — qwen3.8-flash-next-iq3_s'."
+          },
+          "score": {
+            "type": ["number", "null"],
+            "minimum": 1,
+            "maximum": 10
+          },
+          "scale": {
+            "type": "string",
+            "const": "1-10"
+          },
+          "status": {
+            "type": "string"
+          },
+          "basis": {
+            "type": "string",
+            "description": "Where the reading came from: 'deepseek_search' / 'ibkr_news' for production, 'strata_local' for the local reading."
+          },
+          "as_of": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "note": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "comparison": {
+      "type": "string",
+      "description": "'vs production: equal', 'vs production: +1', or 'vs production: not comparable'."
+    },
+    "articles": {
+      "type": "array",
+      "description": "What survived the curation trim, in the order the file already had them.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "index",
+          "status",
+          "published",
+          "site",
+          "url",
+          "title",
+          "authority",
+          "rerank_score",
+          "vendor_summary",
+          "local_summary"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "status": {
+            "type": "string",
+            "description": "The search gate's verdict for this article, preserved as written: 'KEPT', 'QUALIFIED, NOT SENT', 'DROPPED — ...'."
+          },
+          "published": {
+            "type": "string",
+            "description": "'YYYY-MM-DD', or 'undated' when the source gave no date."
+          },
+          "site": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string",
+            "pattern": "^https?://"
+          },
+          "title": {
+            "type": "string"
+          },
+          "authority": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 5
+          },
+          "rerank_score": {
+            "type": "number"
+          },
+          "vendor_summary": {
+            "type": "string"
+          },
+          "local_summary": {
+            "type": "string"
+          },
+          "snippet": {
+            "type": "string",
+            "description": "Optional. Emitted by the current McTrader writer, absent from the 2026-10-18 corpus; preserved when present."
+          },
+          "body": {
+            "type": "string",
+            "description": "Optional, as 'snippet'."
+          }
+        }
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
