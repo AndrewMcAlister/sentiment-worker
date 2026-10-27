@@ -552,8 +552,13 @@ def test_full_pass_finishes_every_marked_file(sandbox, monkeypatch):
             assert payload["scores"][0]["score"] == fixture(config.symbol_of(path.name) + ".json")["scores"][0]["score"]
 
     lines = log_lines(sandbox)
-    assert len(lines) == 3, lines
-    for line in lines:
+    # A poll line per pass and a "processing" line per file are new; the outcome
+    # lines are what this test is about.
+    assert any(" poll files=3" in line for line in lines), lines
+    assert sum(" processing " in line for line in lines) == 3, lines
+    outcomes = [line for line in lines if " kept=" in line]
+    assert len(outcomes) == 3, lines
+    for line in outcomes:
         assert " kept=" in line and " dropped=" in line and "score=" in line
 
 
@@ -571,9 +576,12 @@ def test_dry_run_writes_nothing(sandbox, monkeypatch):
     assert any("dry_run=true" in line for line in log_lines(sandbox))
 
 
-def test_no_marked_files_is_silent(sandbox):
+def test_a_pass_with_no_files_still_says_it_polled(sandbox):
+    """The scheduled task's window is hidden, so silence was indistinguishable
+    from a dead worker. One "poll files=0" line per pass is the heartbeat."""
     assert sentiment_worker.run(directory=sandbox.data, force=True) == sentiment_worker.EXIT_OK
-    assert not list(sandbox.logs.glob("*.log"))
+    lines = log_lines(sandbox)
+    assert len(lines) == 1 and "poll files=0" in lines[0], lines
 
 
 def test_mctrader_down_does_nothing_at_all(sandbox, monkeypatch):
@@ -597,13 +605,13 @@ def test_strata_down_queues_the_files_and_says_so_once(sandbox, monkeypatch):
 
     assert sentiment_worker.run(directory=sandbox.data, force=True) == sentiment_worker.EXIT_OK
     assert digest(pending) == before, "a down Strata must not touch a marked file"
-    lines = log_lines(sandbox)
-    assert len(lines) == 1
-    assert "strata_unavailable" in lines[0] and "pending=1" in lines[0]
+    notices = [line for line in log_lines(sandbox) if "strata_unavailable" in line]
+    assert len(notices) == 1
+    assert "pending=1" in notices[0]
 
-    # The notice is throttled: a second tick within the hour adds nothing.
+    # The notice is throttled: a second tick within the hour adds no second one.
     assert sentiment_worker.run(directory=sandbox.data, force=True) == sentiment_worker.EXIT_OK
-    assert len(log_lines(sandbox)) == 1
+    assert len([l for l in log_lines(sandbox) if "strata_unavailable" in l]) == 1
 
 
 def test_a_second_instance_stands_down(sandbox, monkeypatch):
@@ -616,7 +624,9 @@ def test_a_second_instance_stands_down(sandbox, monkeypatch):
 
     assert code == sentiment_worker.EXIT_OK
     assert (sandbox.data / "BAC.us.new.json").exists(), "a second tick processed the file"
-    assert not list(sandbox.logs.glob("*.log"))
+    # The poll line is written before the lock is taken, so "no log at all" is no
+    # longer the test: the test is that nothing was PROCESSED.
+    assert not any(" processing " in line for line in log_lines(sandbox))
 
 
 def test_a_file_being_written_is_never_claimed():

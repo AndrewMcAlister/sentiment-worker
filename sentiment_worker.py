@@ -380,6 +380,17 @@ def run(
             store.append_log(f"{store.iso(store.now_utc())} cannot_list error={json.dumps(str(exc))}", log_dir=log_dir)
             return EXIT_FAILED
 
+    # Every pass says it looked, on the console and in the day's log. The task's
+    # window is hidden and its output goes nowhere, so without this a five-minute
+    # cadence and a dead worker are indistinguishable from the outside - which is
+    # exactly the question that took an hour to answer on 2026-10-23.
+    poll_line = (
+        f"{store.iso(store.now_utc())} poll files={len(candidates)}"
+        + (f" names={','.join(p.name for p in candidates)}" if candidates else "")
+    )
+    print(poll_line, flush=True)
+    store.append_log(poll_line, log_dir=log_dir)
+
     if not candidates:
         return EXIT_OK
 
@@ -417,6 +428,9 @@ def _run_locked(
         # A timestamp per file, not per pass: a backlog drains over an hour and
         # every finished file should say when its own reading was made.
         now = store.now_utc()
+        processing_line = f"{store.iso(now)} processing {path.name}"
+        print(f"  {processing_line}", flush=True)
+        store.append_log(processing_line, log_dir=log_dir)
         try:
             outcome = process_file(
                 path,
