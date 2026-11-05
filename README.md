@@ -103,6 +103,23 @@ finished payload is written *through* the marked name and then renamed to the
 unmarked name, so at every instant a complete, validated file exists under one of
 the two names.
 
+## How it is started
+
+`SentimentWorker` is a Windows service, **demand-start**, and it declares a dependency
+on `Strata`. That combination is the point:
+
+- starting it starts the Strata model server first (`sc start SentimentWorker`);
+- McTrader's start scripts start it, so it comes up with the trading system rather than at
+  boot (`scripts\StartMcTraderHeadless.ps1` for the boot task, `scripts\StartMcTrader.bat`
+  for the interactive one - the latter needs Administrator, and says so when it cannot);
+- because Strata has a dependent service, the SCM refuses to stop Strata while the worker
+  is running. Stop the worker first: `scripts\StopMcTrader.bat` does exactly that, before
+  it stops anything else, and refuses to report a clean stop if the worker survived.
+
+It can also be started by hand from services.msc or Task Manager. A reinstall keeps the
+demand start type (`service.py install`), so a reinstall cannot quietly put it back into
+the boot path.
+
 ## The scheduled task
 
 | | |
