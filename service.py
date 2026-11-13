@@ -572,9 +572,12 @@ def command_install(args) -> int:
     interval = max(30.0, float(args.interval))
     bin_path = f'"{python}" "{SERVICE_SCRIPT}" run --interval {int(interval)} --name {args.name}'
     register_service(args.name, bin_path)
-    if DEPENDENCY:
-        subprocess.run(["sc.exe", "config", args.name, "depend=", DEPENDENCY],
-                       capture_output=True, timeout=15, check=False)
+    # Always write the dependency list, even when it is empty.  `sc config depend=` is the
+    # only way to clear one, and a service that was once installed with `depend= Strata`
+    # keeps it forever otherwise: the SCM then starts Strata before this service, which made
+    # "start the worker" look like "the worker woke the model".  Reinstalling is the repair.
+    subprocess.run(["sc.exe", "config", args.name, "depend=", DEPENDENCY],
+                   capture_output=True, timeout=15, check=False)
     # A pass that dies should come back by itself: the worker tolerates Strata being down.
     subprocess.run(["sc.exe", "failure", args.name, "reset=", "86400",
                     "actions=", "restart/5000/restart/30000/restart/60000"],
