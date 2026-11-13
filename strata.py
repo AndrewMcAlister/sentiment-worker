@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import socket
+import time
 import urllib.error
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import config
 
@@ -102,6 +104,97 @@ def is_up() -> bool:
     except StrataError:
         return False
     return True
+
+
+def listening(timeout: float = 1.0) -> bool:
+    """Whether anything owns Strata's port right now.
+
+    A TCP connect, not an HTTP request: the server binds 8080 only after the model is in
+    VRAM, and this is the cheapest way to ask "is the port mine to use yet".
+    """
+    try:
+        with socket.create_connection((config.STRATA_HOST, config.STRATA_PORT), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def starting_flag_is_fresh() -> bool:
+    """Whether a starter has said it is loading Strata and has not finished yet."""
+    return _flag_age() < config.STRATA_STARTING_FLAG_SECONDS
+
+
+def _flag_age() -> float:
+    """Seconds since the starting flag was written; ``inf`` when there is none."""
+    try:
+        return max(0.0, time.time() - Path(config.STRATA_STARTING_FLAG).stat().st_mtime)
+    except OSError:
+        return float("inf")
+
+
+def ensure(
+    *,
+    start: Optional[Callable[[], Any]] = None,
+    listen: Optional[Callable[[], bool]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+    clock: Optional[Callable[[], float]] = None,
+    log: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    """Make sure *some* Strata is answering, without competing with one that is loading.
+
+    The rule, in the order it is applied:
+
+    * the port answers        -> use whatever owns it (the service, or the process started
+                                 from the desktop shortcut) and start nothing;
+    * a fresh starting flag   -> a Strata is loading. Wait for the port, up to
+                                 ``STRATA_LOAD_WAIT_SECONDS``, and stop waiting as soon as
+                                 the flag disappears. Only then consider starting one;
+    * nothing is listening    -> take the flag (the starter does that itself) and start the
+      and nothing is starting    service through ``start``, then wait for the port.
+
+    Waiting rather than starting is the whole point: a cold load takes minutes, so a check
+    that treated "nothing is listening" as "nothing is happening" would put a second 15 GB
+    model on the same card. The flag's staleness (``STRATA_STARTING_FLAG_SECONDS``) bounds
+    the wait when a starter crashed and left the file behind.
+
+    ``start``, ``listen``, ``sleep`` and ``clock`` are injectable so a test can drive the
+    whole ladder without a real service, a real waiting period or a real clock.
+    """
+    listen = listen or listening
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    log = log or (lambda message: None)
+
+    if listen():
+        return {"action": "in-use"}
+
+    if starting_flag_is_fresh():
+        log("a Strata is starting; waiting for its port instead of starting a second one")
+        deadline = clock() + config.STRATA_LOAD_WAIT_SECONDS
+        while clock() < deadline:
+            sleep(config.STRATA_LOAD_POLL_SECONDS)
+            if listen():
+                return {"action": "waited"}
+            if not starting_flag_is_fresh():
+                break
+        if listen():
+            return {"action": "waited"}
+
+    if start is None:
+        return {"action": "down"}
+
+    log("nothing is listening and nothing is starting; starting the Strata service")
+    try:
+        outcome = start()
+    except Exception as exc:  # noqa: BLE001 - a service that will not start is a down Strata
+        return {"action": "start-failed", "detail": f"{exc.__class__.__name__}: {exc}"}
+
+    deadline = clock() + config.STRATA_LOAD_WAIT_SECONDS
+    while clock() < deadline:
+        if listen():
+            return {"action": "started", "detail": outcome}
+        sleep(config.STRATA_LOAD_POLL_SECONDS)
+    return {"action": "start-timeout", "detail": outcome}
 
 
 def article_prompt(article: dict) -> str:

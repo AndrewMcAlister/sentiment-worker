@@ -42,7 +42,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import config
 import curation
@@ -362,6 +362,8 @@ def run(
     only: Optional[Path] = None,
     verbose: bool = False,
     log_dir: Optional[Path] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    ensure_strata: Optional[Callable[[], object]] = None,
 ) -> int:
     """One pass.  Returns the process exit code.
 
@@ -401,6 +403,8 @@ def run(
                 dry_run=dry_run,
                 verbose=verbose,
                 log_dir=log_dir,
+                should_stop=should_stop,
+                ensure_strata=ensure_strata,
             )
     except store.LockBusy:
         # Another tick is working.  That is the guard doing its job, not an
@@ -414,8 +418,16 @@ def _run_locked(
     dry_run: bool,
     verbose: bool,
     log_dir: Optional[Path],
+    should_stop: Optional[Callable[[], bool]] = None,
+    ensure_strata: Optional[Callable[[], object]] = None,
 ) -> int:
     up, detail = strata_is_up()
+    if not up and ensure_strata is not None:
+        # "Nothing listening" is not "nothing starting": the gate waits for a Strata that is
+        # loading and only starts the service when nothing is happening at all.  Injected by
+        # the service wrapper, the one caller that may start a service.
+        ensure_strata()
+        up, detail = strata_is_up()
     if not up:
         _note_strata_down(len(candidates), detail, log_dir=log_dir)
         return EXIT_OK
@@ -425,6 +437,16 @@ def _run_locked(
     exit_code = EXIT_OK
 
     for path in candidates:
+        # A service stop used to wait for the whole pass: 297 s on 2026-11-11, which is
+        # what "stuck in Stop Pending" was. The file in flight finishes (it is written by
+        # rename, so stopping between them loses nothing), and the rest wait for the next
+        # pass. Asked only when a caller can answer it - a command-line pass never is.
+        if should_stop is not None and should_stop():
+            store.append_log(
+                f"{store.iso(store.now_utc())} stopped by request; the remaining files wait for the next pass",
+                log_dir=log_dir,
+            )
+            break
         # A timestamp per file, not per pass: a backlog drains over an hour and
         # every finished file should say when its own reading was made.
         now = store.now_utc()

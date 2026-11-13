@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -670,3 +671,141 @@ def test_australian_files_are_scored_before_american_ones(sandbox):
     listed = [p.name for p in store.discover(sandbox.data)]
     assert listed[0].endswith(".au.new.json"), listed
     assert listed[-1].endswith(".uk.new.json"), listed
+
+class TestStrataGate:
+    """``strata.ensure``: use what is there, wait for what is starting, start only when idle.
+
+    The clock and the sleep are injected, so the whole ladder runs in microseconds and the
+    post-start wait does not actually sleep for five minutes.
+    """
+
+    class Clock:
+        def __init__(self) -> None:
+            self.now = 0.0
+            self.slept: list = []
+
+        def clock(self) -> float:
+            return self.now
+
+        def sleep(self, seconds: float) -> None:
+            self.slept.append(seconds)
+            self.now += seconds
+
+    @staticmethod
+    def flag(tmp_path, age_seconds: float):
+        path = tmp_path / "strata.starting"
+        path.write_text('{"pid": 1}', encoding="utf-8")
+        if age_seconds:
+            stamp = time.time() - age_seconds
+            os.utime(path, (stamp, stamp))
+        return path
+
+    def _gate(self, listen, *, start=None, monkeypatch=None, flag_path=None):
+        clock = self.Clock()
+        return strata.ensure(
+            listen=listen,
+            start=start or (lambda: None),
+            sleep=clock.sleep,
+            clock=clock.clock,
+        ), clock
+
+    def test_a_listening_strata_is_used_and_nothing_is_started(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "STRATA_STARTING_FLAG", str(tmp_path / "absent"))
+        started = []
+        outcome, clock = self._gate(lambda: True, start=lambda: started.append(1))
+
+        assert outcome["action"] == "in-use"
+        assert started == []
+        assert clock.slept == []
+
+    def test_a_fresh_flag_is_waited_for_rather_than_competed_with(self, tmp_path, monkeypatch):
+        # The port answers on the second look: the first is the top-of-gate probe, the second
+        # is after one wait. The flag stays fresh throughout, so nothing may start.
+        monkeypatch.setattr(config, "STRATA_STARTING_FLAG", str(self.flag(tmp_path, 5)))
+        looks = {"count": 0}
+        started = []
+
+        def listen() -> bool:
+            looks["count"] += 1
+            return looks["count"] >= 2
+
+        outcome, clock = self._gate(listen, start=lambda: started.append(1))
+
+        assert outcome["action"] == "waited"
+        assert started == [], "a waiting gate must never start a second Strata"
+        assert len(clock.slept) == 1
+
+    def test_the_wait_ends_when_the_flag_goes_and_nothing_answers(self, tmp_path, monkeypatch):
+        # A starter that crashed: the flag is deleted, the port never answers during the wait,
+        # so the gate stops waiting and starts the service.
+        flag = self.flag(tmp_path, 5)
+        monkeypatch.setattr(config, "STRATA_STARTING_FLAG", str(flag))
+        state = {"up": False}
+        started = []
+
+        def start() -> None:
+            started.append(1)
+            state["up"] = True
+
+        clock = self.Clock()
+
+        def sleep(seconds: float) -> None:
+            clock.sleep(seconds)
+            flag.unlink(missing_ok=True)
+
+        outcome = strata.ensure(
+            listen=lambda: state["up"],
+            start=start,
+            sleep=sleep,
+            clock=clock.clock,
+        )
+
+        assert started, "nothing was starting, so the gate should have started one"
+        assert outcome["action"] == "started"
+
+    def test_a_stale_flag_is_not_waited_for(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            config,
+            "STRATA_STARTING_FLAG",
+            str(self.flag(tmp_path, config.STRATA_STARTING_FLAG_SECONDS + 60)),
+        )
+        state = {"up": False}
+
+        def start() -> None:
+            state["up"] = True
+
+        outcome, clock = self._gate(lambda: state["up"], start=start)
+
+        assert outcome["action"] == "started"
+
+    def test_no_flag_and_no_port_starts_the_service(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "STRATA_STARTING_FLAG", str(tmp_path / "absent"))
+        state = {"up": False}
+
+        def start() -> dict:
+            state["up"] = True
+            return {"state": "running"}
+
+        outcome, _ = self._gate(lambda: state["up"], start=start)
+
+        assert outcome["action"] == "started"
+
+    def test_a_start_that_never_binds_is_reported_not_hidden(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "STRATA_STARTING_FLAG", str(tmp_path / "absent"))
+        outcome, clock = self._gate(lambda: False)
+
+        assert outcome["action"] == "start-timeout"
+        assert len(clock.slept) == int(
+            config.STRATA_LOAD_WAIT_SECONDS / config.STRATA_LOAD_POLL_SECONDS
+        )
+
+    def test_a_start_that_raises_is_reported_as_failed(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "STRATA_STARTING_FLAG", str(tmp_path / "absent"))
+
+        def start() -> None:
+            raise RuntimeError("the service refused to start")
+
+        outcome, _ = self._gate(lambda: False, start=start)
+
+        assert outcome["action"] == "start-failed"
+        assert "refused" in outcome["detail"]

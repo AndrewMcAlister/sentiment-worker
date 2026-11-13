@@ -71,6 +71,22 @@ STRATA_MODELS_URL = STRATA_BASE + "/v1/models"
 STRATA_CHAT_URL = STRATA_BASE + "/v1/chat/completions"
 STRATA_MODELS_TIMEOUT_SECONDS = 5.0
 
+#: 8080 is bound only after the model is in VRAM (40 s warm, minutes cold), so "nothing
+#: is listening" is also true of a Strata that is 20 s into a load.  A starter says so by
+#: dropping this flag before it loads; a fresh flag means wait for the port, not start a
+#: second 15 GB model on the same card.  The same file is written by Strata's service and
+#: by its `Strata-EnsureRunning` task - see sentiment-worker/strata.py: ensure().
+STRATA_HOST = "127.0.0.1"
+STRATA_PORT = 8080
+STRATA_STARTING_FLAG = os.environ.get(
+    "STRATA_STARTING_FLAG", r"C:\ProgramData\Strata\strata.starting"
+)
+#: A flag this old is debris from a crash rather than a load in progress.
+STRATA_STARTING_FLAG_SECONDS = 300.0
+#: How long to wait for a starting Strata to bind, and how often to look.
+STRATA_LOAD_WAIT_SECONDS = 300.0
+STRATA_LOAD_POLL_SECONDS = 15.0
+
 #: The client this worker calls is `D:\news-sentiment\sentiment.py` — the
 #: measured one, with the `enable_thinking: false` request and the null-content
 #: check.  It is imported, never copied: a second client would drift from the
@@ -123,9 +139,13 @@ MAX_EVIDENCE_PHRASE_CHARS = 200
 MAX_FILES_PER_RUN = 200
 
 #: Per-request ceiling handed to the shared client.  Cold requests were measured
-#: at ~10 s and warm at ~0.35 s; a minute is a wide margin that still ends a
-#: hung connection rather than pinning the worker until the next tick.
-REQUEST_TIMEOUT_SECONDS = 60.0
+#: at ~10 s and warm at ~0.35 s; a minute was a wide margin on an idle model.
+#: It is not wide when the model is busy: the worker and a person's chat share
+#: one engine, and a request that queues behind a 20 s prompt (or behind a
+#: conversation that is mid-answer) passed 60 s on 2026-11-11 and aborted the
+#: whole pass, which is what kept the backlog from draining.  Three minutes still
+#: ends a genuinely hung connection, and a timeout costs a whole pass.
+REQUEST_TIMEOUT_SECONDS = 180.0
 
 #: The worker names itself in the log with this, so a line can be traced to the
 #: task that wrote it.

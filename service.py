@@ -24,11 +24,12 @@ What it does about Strata: nothing special, and that is deliberate.  ``sentiment
 checks Strata before it scores, logs ``strata_unavailable`` and leaves the files marked, so a
 model server that stops and starts under the service simply costs passes, not files.
 
-The service is DEMAND_START and declares a dependency on Strata, and that pair is the
-point: starting it starts the model server first, and McTrader's start scripts start it, so
-it comes up with the trading system rather than at boot.  Strata cannot be stopped while a
-dependent service is running, which is why StopMcTrader stops this service before anything
-else - the dependency is kept, not removed, because it is what makes one start pull up both.
+The service is DEMAND_START and declares NO dependency on Strata.  It waits on its own for the
+model to answer (see above), so the two are independent in both directions: Strata can be stopped
+or restarted while this runs, and McTrader's start scripts start Strata first, then this.  A
+dependency would make the SCM refuse to stop Strata while this service runs - which is exactly
+the thing that must not happen, because "stop the service, load a different model" is a normal
+thing to do in the middle of the day.
 """
 
 from __future__ import annotations
@@ -47,7 +48,7 @@ SERVICE_NAME = "SentimentWorker"
 DISPLAY_NAME = "Strata Sentiment Worker"
 DESCRIPTION = ("Scores the marked sentiment files in D:\\temp\\McTrader\\Sentiment with the "
                "local Strata model, one pass every few minutes.")
-DEPENDENCY = "Strata"                       # the model server this worker relies on
+DEPENDENCY = ""                             # none: Strata is stopped and restarted independently
 DEFAULT_INTERVAL = 300.0
 #: While Strata is away there is nothing to do but wait: no pass is attempted (a pass could
 #: only log that the model is missing), and the service checks back on this slower cadence
@@ -300,6 +301,19 @@ def stop_service(name: str = SERVICE_NAME, timeout: float = 900) -> dict:
         advapi32.CloseServiceHandle(scm)
 
 
+def ensure_strata() -> dict:
+    """Make sure a Strata is answering, without ever competing with one that is loading.
+
+    The rule - port first, then a fresh starting flag means wait, and only then start - lives
+    in ``strata.ensure``.  This function is what it may call to start one: service control is
+    this module's job, not the worker's, and the worker is handed it as a callable so it never
+    imports this module (which imports the worker).
+    """
+    import strata  # noqa: PLC0415 - imported where it is used, like the worker is
+
+    return strata.ensure(start=lambda: start_service("Strata"), log=log)
+
+
 def delete_service(name: str = SERVICE_NAME) -> None:
     scm = _open_scm(SC_MANAGER_ALL_ACCESS)
     service = None
@@ -428,7 +442,10 @@ class Supervisor:
                 strata_away = False
             started = time.monotonic()
             try:
-                code = worker.run()
+                # stop_event is handed in so a stop lands between files instead of after the
+                # whole pass: the pass used to run to its end, which is what "Stop Pending"
+                # meant on 2026-11-11 (297 s).
+                code = worker.run(should_stop=self.stop_event.is_set, ensure_strata=ensure_strata)
             except BaseException as exc:                 # noqa: BLE001 - a watchdog must not die
                 log(f"pass raised {exc.__class__.__name__}: {exc}")
                 code = 1
@@ -445,7 +462,13 @@ class Supervisor:
             else:
                 previous = pending
                 if pending:
-                    state = f"{len(pending)} stuck (unchanged) - they are not retried in a burst"
+                    # Name them, so the log says WHICH files are stuck and where the reason is.
+                    # Nothing is moved out of the queue: the queue is the record, and a file that
+                    # cannot be scored staying in it is the point.
+                    named = ", ".join(sorted(pending)[:5])
+                    more = "" if len(pending) <= 5 else f" and {len(pending) - 5} more"
+                    state = (f"{len(pending)} stuck (unchanged): {named}{more} - kept in the queue, "
+                             f"state/failures.json says why")
                 else:
                     state = "queue empty"
                 # Start-to-start, so a pass that took most of the window does not push the
@@ -516,16 +539,16 @@ def command_install(args) -> int:
     interval = max(30.0, float(args.interval))
     bin_path = f'"{python}" "{SERVICE_SCRIPT}" run --interval {int(interval)} --name {args.name}'
     register_service(args.name, bin_path)
-    # The model server first: the SCM starts Strata before this service, which is why a
-    # restart of Strata does not need this one restarted too.
-    subprocess.run(["sc.exe", "config", args.name, "depend=", DEPENDENCY],
-                   capture_output=True, timeout=15, check=False)
+    if DEPENDENCY:
+        subprocess.run(["sc.exe", "config", args.name, "depend=", DEPENDENCY],
+                       capture_output=True, timeout=15, check=False)
     # A pass that dies should come back by itself: the worker tolerates Strata being down.
     subprocess.run(["sc.exe", "failure", args.name, "reset=", "86400",
                     "actions=", "restart/5000/restart/30000/restart/60000"],
                    capture_output=True, timeout=15, check=False)
     log(f"installed '{args.name}': {bin_path}")
-    print(f"Service '{args.name}' created (Demand, depends on {DEPENDENCY}).")
+    print(f"Service '{args.name}' created (Demand"
+          + (f", depends on {DEPENDENCY})." if DEPENDENCY else ", no dependency)."))
     print(f"  python   {python}")
     print(f"  interval {int(interval)}s")
     print(f"  logs     {LOG_DIR}")
