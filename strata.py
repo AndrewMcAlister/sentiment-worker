@@ -139,6 +139,8 @@ def ensure(
     sleep: Optional[Callable[[float], None]] = None,
     clock: Optional[Callable[[], float]] = None,
     log: Optional[Callable[[str], None]] = None,
+    wait_seconds: Optional[float] = None,
+    poll_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Make sure *some* Strata is answering, without competing with one that is loading.
 
@@ -164,15 +166,17 @@ def ensure(
     sleep = sleep or time.sleep
     clock = clock or time.monotonic
     log = log or (lambda message: None)
+    wait = wait_seconds if wait_seconds is not None else config.STRATA_LOAD_WAIT_SECONDS
+    poll = poll_seconds if poll_seconds is not None else config.STRATA_LOAD_POLL_SECONDS
 
     if listen():
         return {"action": "in-use"}
 
     if starting_flag_is_fresh():
         log("a Strata is starting; waiting for its port instead of starting a second one")
-        deadline = clock() + config.STRATA_LOAD_WAIT_SECONDS
+        deadline = clock() + wait
         while clock() < deadline:
-            sleep(config.STRATA_LOAD_POLL_SECONDS)
+            sleep(poll)
             if listen():
                 return {"action": "waited"}
             if not starting_flag_is_fresh():
@@ -189,11 +193,11 @@ def ensure(
     except Exception as exc:  # noqa: BLE001 - a service that will not start is a down Strata
         return {"action": "start-failed", "detail": f"{exc.__class__.__name__}: {exc}"}
 
-    deadline = clock() + config.STRATA_LOAD_WAIT_SECONDS
+    deadline = clock() + wait
     while clock() < deadline:
         if listen():
             return {"action": "started", "detail": outcome}
-        sleep(config.STRATA_LOAD_POLL_SECONDS)
+        sleep(poll)
     return {"action": "start-timeout", "detail": outcome}
 
 

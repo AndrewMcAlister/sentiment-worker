@@ -311,7 +311,7 @@ def ensure_strata() -> dict:
     """
     import strata  # noqa: PLC0415 - imported where it is used, like the worker is
 
-    return strata.ensure(start=lambda: start_service("Strata"), log=log)
+    return strata.ensure(start=lambda: start_service("Strata"), log=log, wait_seconds=180.0)
 
 
 def delete_service(name: str = SERVICE_NAME) -> None:
@@ -396,6 +396,32 @@ class Supervisor:
         import sentiment_worker                          # noqa: PLC0415 - only under the SCM or `run`
         return sentiment_worker
 
+    def _pending_paths(self):
+        """The marked files waiting now, as paths, or [] when they cannot be listed."""
+        try:
+            import config as worker_config                # noqa: PLC0415 - imported with the worker
+            import store                                  # noqa: PLC0415
+            return list(store.discover(Path(worker_config.SENTIMENT_DIR)))
+        except Exception as exc:                          # noqa: BLE001 - a count must never stop the loop
+            log(f"cannot list the queued files: {exc.__class__.__name__}: {exc}")
+            return []
+
+    def _fresh_work(self, worker):
+        """Whether the queue holds anything a model could actually change.
+
+        A file that failed on the previous pass is not fresh work: the same bytes cannot
+        pass the check that just rejected them, and waking a 15 GB model for them is what
+        the two stuck files did 1,309 times.
+        """
+        pending = self._pending_paths()
+        if not pending:
+            return False
+        try:
+            return bool(worker.fresh_work(pending, worker.store.load_failures()))
+        except Exception as exc:                          # noqa: BLE001 - an unknown queue is not work
+            log(f"cannot judge the queue: {exc.__class__.__name__}: {exc}")
+            return False
+
     def _pending_names(self):
         """The marked files waiting now, by name, or None when they cannot be listed."""
         try:
@@ -430,6 +456,13 @@ class Supervisor:
             # The model first: with Strata away a pass can only log a failure, so the service
             # waits quietly on its own slower cadence and attempts nothing at all.
             up, detail = self._strata_up(worker)
+            if not up and self._fresh_work(worker):
+                # There is work a model could change and nothing is listening. The gate waits
+                # for a Strata that is already loading and starts the service only when nothing
+                # is happening at all, so this never competes with a load in flight.
+                outcome = ensure_strata()
+                log(f"strata was down and there is fresh work: {outcome.get('action')}")
+                up, detail = self._strata_up(worker)
             if not up:
                 if not strata_away:
                     log(f"strata is not answering ({detail}); sleeping {int(STRATA_RETRY_S)}s between checks")
