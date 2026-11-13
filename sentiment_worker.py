@@ -40,7 +40,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -412,8 +412,53 @@ def run(
         return EXIT_OK
 
 
-def _run_locked(
-    candidates: Sequence[Path],
+def _stuck_files(failures: dict) -> dict:
+    """File name -> when it last failed, as a POSIX timestamp.
+
+    ``state/failures.json`` keys by symbol and records ``file`` and ``last_utc``; the name
+    is what a candidate can be matched on, and the moment is what tells "the same bytes
+    failed again" from "something new was written".
+    """
+    stuck = {}
+    for entry in failures.values():
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("file") or "")
+        stamp = str(entry.get("last_utc") or "")
+        if not name or not stamp:
+            continue
+        try:
+            moment = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        stuck[name] = moment.timestamp()
+    return stuck
+
+
+def fresh_work(candidates: Sequence[Path], failures: dict) -> List[Path]:
+    """The candidates worth waking Strata for: new, or rewritten since they last failed.
+
+    A file that has failed on every pass since 23:04 is not work.  The same bytes cannot
+    pass the schema check that just rejected them, so asking for a model would start a
+    15 GB load to score nothing - which is what the two stuck files did 1,309 times.  A
+    second of slack absorbs the filesystem's timestamp rounding.
+    """
+    stuck = _stuck_files(failures)
+    fresh = []
+    for path in candidates:
+        failed_at = stuck.get(path.name)
+        if failed_at is None:
+            fresh.append(path)
+            continue
+        try:
+            if path.stat().st_mtime > failed_at + 1:
+                fresh.append(path)
+        except OSError:
+            continue
+    return fresh
+
+
+def _run_locked(    candidates: Sequence[Path],
     *,
     dry_run: bool,
     verbose: bool,
@@ -422,7 +467,7 @@ def _run_locked(
     ensure_strata: Optional[Callable[[], object]] = None,
 ) -> int:
     up, detail = strata_is_up()
-    if not up and ensure_strata is not None:
+    if not up and ensure_strata is not None and fresh_work(candidates, store.load_failures()):
         # "Nothing listening" is not "nothing starting": the gate waits for a Strata that is
         # loading and only starts the service when nothing is happening at all.  Injected by
         # the service wrapper, the one caller that may start a service.

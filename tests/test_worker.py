@@ -809,3 +809,58 @@ class TestStrataGate:
 
         assert outcome["action"] == "start-failed"
         assert "refused" in outcome["detail"]
+
+class TestFreshWork:
+    """A stuck file must not wake Strata; a new or rewritten one must."""
+
+    @staticmethod
+    def failure(name: str, when: datetime) -> dict:
+        return {
+            "symbol": name.split(".")[0],
+            "file": name,
+            "attempts": 1309,
+            "last_error": "does not match schema.json",
+            "last_utc": when.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+
+    def _failures(self, *entries) -> dict:
+        return {entry["symbol"]: entry for entry in entries}
+
+    def test_a_stuck_file_is_not_work(self, tmp_path):
+        path = tmp_path / "APX.au.new.json"
+        path.write_text("{}", encoding="utf-8")
+        # The failure is from after the last write, so these bytes have already been refused.
+        when = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+
+        fresh = sentiment_worker.fresh_work([path], self._failures(self.failure(path.name, when)))
+
+        assert fresh == []
+
+    def test_a_new_file_is_work(self, tmp_path):
+        path = tmp_path / "NEW.us.new.json"
+        path.write_text("{}", encoding="utf-8")
+
+        fresh = sentiment_worker.fresh_work([path], {})
+
+        assert fresh == [path]
+
+    def test_a_file_rewritten_since_it_failed_is_work(self, tmp_path):
+        path = tmp_path / "APX.au.new.json"
+        path.write_text("{}", encoding="utf-8")
+        # The failure predates the file: something rewrote it, so it is worth a model.
+        old = datetime.fromtimestamp(path.stat().st_mtime - 600, tz=timezone.utc)
+
+        fresh = sentiment_worker.fresh_work([path], self._failures(self.failure(path.name, old)))
+
+        assert fresh == [path]
+
+    def test_a_failure_from_another_name_does_not_shadow_a_new_file(self, tmp_path):
+        path = tmp_path / "APX.au.new.json"
+        path.write_text("{}", encoding="utf-8")
+        stale = datetime.fromtimestamp(path.stat().st_mtime - 600, tz=timezone.utc)
+
+        fresh = sentiment_worker.fresh_work(
+            [path], self._failures(self.failure("NXT.au.new.json", stale))
+        )
+
+        assert fresh == [path]
