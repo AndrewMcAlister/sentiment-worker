@@ -417,11 +417,11 @@ class Supervisor:
             return []
 
     def _fresh_work(self, worker):
-        """Whether the queue holds anything a model could actually change.
+        """Whether the queue holds any pending file.
 
-        A file that failed on the previous pass is not fresh work: the same bytes cannot
-        pass the check that just rejected them, and waking a 15 GB model for them is what
-        the two stuck files did 1,309 times.
+        Pending is the whole test. A file that cannot be processed is renamed to the Failed
+        state and leaves the queue, so anything still in it is work the operator or the
+        producer put there - including a file renamed back from Failed to be rescored.
         """
         pending = self._pending_paths()
         if not pending:

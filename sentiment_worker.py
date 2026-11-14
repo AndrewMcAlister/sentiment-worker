@@ -441,50 +441,20 @@ def run(
         return EXIT_OK
 
 
-def _stuck_files(failures: dict) -> dict:
-    """File name -> when it last failed, as a POSIX timestamp.
-
-    ``state/failures.json`` keys by symbol and records ``file`` and ``last_utc``; the name
-    is what a candidate can be matched on, and the moment is what tells "the same bytes
-    failed again" from "something new was written".
-    """
-    stuck = {}
-    for entry in failures.values():
-        if not isinstance(entry, dict):
-            continue
-        name = str(entry.get("file") or "")
-        stamp = str(entry.get("last_utc") or "")
-        if not name or not stamp:
-            continue
-        try:
-            moment = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-        stuck[name] = moment.timestamp()
-    return stuck
-
-
 def fresh_work(candidates: Sequence[Path], failures: dict) -> List[Path]:
-    """The candidates worth waking Strata for: new, or rewritten since they last failed.
+    """The pending files, which are the work.
 
-    A file that has failed on every pass since 23:04 is not work.  The same bytes cannot
-    pass the schema check that just rejected them, so asking for a model would start a
-    15 GB load to score nothing - which is what the two stuck files did 1,309 times.  A
-    second of slack absorbs the filesystem's timestamp rounding.
+    This used to consult ``state/failures.json`` and call a file "stuck, unchanged" when its
+    last failure postdated its mtime, so a pass would not retry it. Two things made that the
+    wrong rule. A file that cannot be processed is now renamed to the Failed state and leaves
+    the pending set by itself, so a file still sitting in it is one the operator put there or
+    the producer dropped there. And renaming a Failed file back is exactly the instruction
+    "score this again", which a failure recorded before the rename would have vetoed.
+
+    ``failures`` is kept in the signature: the pass still records and clears entries, and a
+    caller reading them for a log line should not have to know this function ignores them.
     """
-    stuck = _stuck_files(failures)
-    fresh = []
-    for path in candidates:
-        failed_at = stuck.get(path.name)
-        if failed_at is None:
-            fresh.append(path)
-            continue
-        try:
-            if path.stat().st_mtime > failed_at + 1:
-                fresh.append(path)
-        except OSError:
-            continue
-    return fresh
+    return list(candidates)
 
 
 def mark_failed(path: Path, error: str, *, log_dir: Optional[Path] = None) -> None:

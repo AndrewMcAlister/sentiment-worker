@@ -829,7 +829,7 @@ class TestStrataGate:
         assert "refused" in outcome["detail"]
 
 class TestFreshWork:
-    """A stuck file must not wake Strata; a new or rewritten one must."""
+    """Pending is work. A file that cannot be processed leaves the queue by being renamed."""
 
     @staticmethod
     def failure(name: str, when: datetime) -> dict:
@@ -844,15 +844,20 @@ class TestFreshWork:
     def _failures(self, *entries) -> dict:
         return {entry["symbol"]: entry for entry in entries}
 
-    def test_a_stuck_file_is_not_work(self, tmp_path):
+    def test_a_pending_file_is_work_even_after_a_failure(self, tmp_path):
+        # Renaming a Failed file back is the operator saying "score this again". A failure
+        # recorded before that rename used to veto it, which left the file unprocessable
+        # with no way back short of touching it.
         path = tmp_path / "APX.au.new.json"
         path.write_text("{}", encoding="utf-8")
-        # The failure is from after the last write, so these bytes have already been refused.
         when = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
 
         fresh = sentiment_worker.fresh_work([path], self._failures(self.failure(path.name, when)))
 
-        assert fresh == []
+        assert fresh == [path]
+
+    def test_an_empty_queue_is_no_work(self):
+        assert sentiment_worker.fresh_work([], {}) == []
 
     def test_a_new_file_is_work(self, tmp_path):
         path = tmp_path / "NEW.us.new.json"
