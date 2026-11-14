@@ -1060,3 +1060,25 @@ class TestStopMidFile:
         assert pending.exists()
         assert not (sandbox.data / "BAC.json").exists()
         assert any("stopped by request" in line for line in log_lines(sandbox))
+
+
+class TestStaleLocalReading:
+    """A pending file's local reading is overwritten, so a stale value must not block it."""
+
+    def test_a_zero_local_score_is_overwritten_rather_than_rejected(self, sandbox, monkeypatch):
+        payload = fixture("BAC.json")
+        payload["local_sentiment_score"] = 0
+        payload["local_sentiment_status"] = "ok"
+        pending = sandbox.data / "BAC.us.new.json"
+        pending.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
+        monkeypatch.setattr(strata, "score_article", fake_model())
+
+        code = sentiment_worker.run(directory=sandbox.data, force=True)
+
+        assert code == sentiment_worker.EXIT_OK
+        finished = sandbox.data / "BAC.us.json"
+        assert finished.is_file(), "the pass should write the file, not mark it Failed"
+        assert not (sandbox.data / "BAC.us.Failed.json").exists()
+        written = json.loads(finished.read_text(encoding="utf-8"))
+        assert written["local_sentiment_score"] != 0, "the stale score is replaced"

@@ -191,6 +191,14 @@ def process_file(
                 f"refusing to write {finished.name}"
             )
 
+        # A marked file's local reading is stale output, not input. The schema documents it
+        # as "null while pending" with status 'pending' (schema.json), and this pass replaces
+        # both, so they are normalised before validation: a hand-edit - or a reading left from
+        # an older scale - must not make a file unprocessable by carrying exactly the value
+        # this pass exists to overwrite. Everything else is still validated strictly.
+        payload["local_sentiment_score"] = None
+        payload["local_sentiment_status"] = "pending"
+
         # A marked file that cannot satisfy the schema cannot produce one that
         # does: this is where a corrupted append is caught, before any inference
         # is spent on it.
