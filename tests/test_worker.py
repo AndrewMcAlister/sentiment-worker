@@ -485,7 +485,7 @@ def test_lock_does_not_survive_a_crash(tmp_path):
 # ── end to end ───────────────────────────────────────────────────────────────
 
 
-def test_a_failing_file_is_left_exactly_as_it_was(sandbox, monkeypatch):
+def test_a_failing_file_is_left_as_failed_unchanged(sandbox, monkeypatch):
     pending = make_pending("BAC.json", sandbox.data)
     before = digest(pending)
     monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
@@ -498,7 +498,11 @@ def test_a_failing_file_is_left_exactly_as_it_was(sandbox, monkeypatch):
     code = sentiment_worker.run(directory=sandbox.data, force=True)
 
     assert code == sentiment_worker.EXIT_FAILED
-    assert digest(pending) == before, "the marked file was modified by a failed file"
+    # Out of the pending set, still in the folder, and byte-identical to what arrived.
+    renamed = sandbox.data / "BAC.us.Failed.json"
+    assert renamed.is_file(), "a file that cannot be scored is left under the Failed state"
+    assert not pending.exists()
+    assert digest(renamed) == before, "the Failed file keeps the bytes it had"
     assert not (sandbox.data / "BAC.json").exists()
     assert any("FAILED" in line for line in log_lines(sandbox))
     journal = store.load_failures(sandbox.state / "failures.json")
@@ -506,7 +510,7 @@ def test_a_failing_file_is_left_exactly_as_it_was(sandbox, monkeypatch):
     assert "no content" in journal["BAC"]["last_error"]
 
 
-def test_a_corrupt_marked_file_is_left_alone(sandbox, monkeypatch):
+def test_a_corrupt_marked_file_is_left_as_failed(sandbox, monkeypatch):
     payload = fixture("BAC.json")
     payload["surprise"] = "not in the schema"
     pending = sandbox.data / "BAC.us.new.json"
@@ -518,7 +522,10 @@ def test_a_corrupt_marked_file_is_left_alone(sandbox, monkeypatch):
     code = sentiment_worker.run(directory=sandbox.data, force=True)
 
     assert code == sentiment_worker.EXIT_FAILED
-    assert digest(pending) == before
+    renamed = sandbox.data / "BAC.us.Failed.json"
+    assert renamed.is_file()
+    assert not pending.exists()
+    assert digest(renamed) == before
     assert any("surprise" in line and "FAILED" in line for line in log_lines(sandbox))
 
 
@@ -919,3 +926,32 @@ class TestFreshWorkAtServiceLevel:
                     return {}
 
         assert self.supervisor()._fresh_work(Worker) is True
+
+class TestFailedNaming:
+    """A file that cannot be processed is left as <Symbol>.<market>.Failed.json."""
+
+    def test_the_name_replaces_the_state_with_failed(self):
+        assert config.failed_name("BHP.au.new.json") == "BHP.au.Failed.json"
+        assert config.failed_name("MVLL.us.pending.json") == "MVLL.us.Failed.json"
+
+    def test_a_failed_file_is_no_longer_pending(self):
+        assert config.is_failed("BHP.au.Failed.json") is True
+        assert config.is_failed("BHP.au.new.json") is False
+        assert config.is_pending("BHP.au.Failed.json") is False
+
+    def test_the_rename_leaves_it_in_the_folder_and_logs_it(self, tmp_path):
+        path = tmp_path / "MVLL.us.new.json"
+        path.write_text("{}", encoding="utf-8")
+
+        sentiment_worker.mark_failed(path, "not valid JSON", log_dir=tmp_path)
+
+        renamed = tmp_path / "MVLL.us.Failed.json"
+        assert renamed.is_file(), "the file should still be in the folder, under Failed"
+        assert not path.exists()
+        log_text = "".join(p.read_text(encoding="utf-8") for p in tmp_path.glob("*.log"))
+        assert "MVLL.us.new.json -> MVLL.us.Failed.json" in log_text
+        assert "not valid JSON" in log_text
+
+    def test_a_missing_file_does_not_raise(self, tmp_path):
+        # Lost between discovery and the failure: the pass must survive it.
+        sentiment_worker.mark_failed(tmp_path / "GONE.us.new.json", "nope", log_dir=tmp_path)

@@ -40,6 +40,11 @@ PENDING_STATE = "new"
 FINISHED_STATE = "json"
 SEPARATOR = "."
 FINISHED_SUFFIX = ".json"
+#: The state a file is left under when it cannot be processed. Deliberately not a pending
+#: state: renaming a file to this is what takes it out of the queue without deleting the
+#: evidence, and the capital F is how the pipeline spells a terminal failure.
+FAILED_STATE = "Failed"
+FAILED_SUFFIX = SEPARATOR + FAILED_STATE + SEPARATOR + FINISHED_STATE
 
 # Derived from the three states rather than written out again: the parts are the single
 # source, and these are the spellings the rest of the code compares against. Keeping them
@@ -205,6 +210,24 @@ def is_writing(name: str) -> bool:
     suffix = SEPARATOR + WRITING_STATE + SEPARATOR + FINISHED_STATE
     return name.lower().endswith(suffix) and len(country_of(name)) == 2
 
+
+
+def is_failed(name: str) -> bool:
+    """Whether a name is a file that has been left as failed."""
+    return name.lower().endswith(FAILED_SUFFIX.lower())
+
+
+def failed_name(name: str) -> str:
+    """The name a file takes when it cannot be processed: its state becomes ``Failed``.
+
+    ``BHP.au.new.json`` -> ``BHP.au.Failed.json``. A name that is not shaped like a marked
+    file keeps its stem and gains the failed state, so a rename never loses the name.
+    """
+    parts = name.split(SEPARATOR)
+    if len(parts) >= 4:
+        return SEPARATOR.join(parts[:-2] + [FAILED_STATE, FINISHED_STATE])
+    stem = name[: -len(FINISHED_SUFFIX)] if name.lower().endswith(FINISHED_SUFFIX) else name
+    return stem + FAILED_SUFFIX
 
 
 def is_pending(name: str) -> bool:

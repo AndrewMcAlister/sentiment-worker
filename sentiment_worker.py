@@ -458,6 +458,30 @@ def fresh_work(candidates: Sequence[Path], failures: dict) -> List[Path]:
     return fresh
 
 
+def mark_failed(path: Path, error: str, *, log_dir: Optional[Path] = None) -> None:
+    """Leave a file that cannot be processed under the Failed state, in the queue folder.
+
+    The queue is the record and the file stays where the operator looks for it, but a file
+    that can never pass validation must stop being retried: APX and NXT reached 1,309
+    attempts before this existed. Renaming is what takes it out of the pending set, and the
+    line written here names the file it became, so the log and the folder agree.
+    """
+    target = path.with_name(config.failed_name(path.name))
+    try:
+        path.rename(target)
+    except OSError as exc:
+        store.append_log(
+            f"{store.iso(store.now_utc())} {path.name} could not be marked Failed: "
+            f"{exc.__class__.__name__}: {exc}",
+            log_dir=log_dir,
+        )
+        return
+    store.append_log(
+        f"{store.iso(store.now_utc())} {path.name} -> {target.name} error={json.dumps(error)}",
+        log_dir=log_dir,
+    )
+
+
 def _run_locked(    candidates: Sequence[Path],
     *,
     dry_run: bool,
@@ -536,6 +560,8 @@ def _run_locked(    candidates: Sequence[Path],
         entry["file"] = outcome.name
         failures[outcome.symbol] = entry
         store.save_failures(failures)
+        # Left in the folder under the Failed state: out of the pending set, still evidence.
+        mark_failed(path, outcome.error, log_dir=log_dir)
 
     return exit_code
 
