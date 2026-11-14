@@ -1002,3 +1002,40 @@ class TestGateHonoursStop:
         assert outcome["action"] == "stopped"
         assert started == [], "a stop must not leave a start behind"
         assert clock.now < config.STRATA_LOAD_WAIT_SECONDS, "it should not wait the full window"
+
+class TestStopMidFile:
+    """A stop lands between articles, and leaves the file it abandoned untouched."""
+
+    def test_a_stop_while_scoring_leaves_the_file_marked(self, sandbox, monkeypatch):
+        pending = make_pending("BAC.json", sandbox.data)
+        before = digest(pending)
+        monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
+        monkeypatch.setattr(strata, "score_article", fake_model())
+
+        with pytest.raises(sentiment_worker.FileStopped):
+            sentiment_worker.process_file(
+                pending,
+                model="test-model",
+                now=store.now_utc(),
+                should_stop=lambda: True,
+            )
+
+        assert pending.exists(), "an abandoned file stays exactly where it was"
+        assert digest(pending) == before
+        assert not (sandbox.data / "BAC.json").exists()
+
+    def test_a_stop_mid_pass_abandons_the_file_and_ends_the_pass(self, sandbox, monkeypatch):
+        pending = make_pending("BAC.json", sandbox.data)
+        monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
+        monkeypatch.setattr(strata, "score_article", fake_model())
+        checks = {"count": 0}
+
+        def stop() -> bool:
+            checks["count"] += 1
+            return checks["count"] > 1      # the loop's own check passes, the article's stops
+
+        sentiment_worker.run(directory=sandbox.data, force=True, should_stop=stop)
+
+        assert pending.exists()
+        assert not (sandbox.data / "BAC.json").exists()
+        assert any("stopped by request" in line for line in log_lines(sandbox))

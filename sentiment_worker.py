@@ -104,6 +104,15 @@ class FileFailed(RuntimeError):
     """The file was not finished.  It is left exactly as it was found."""
 
 
+class FileStopped(RuntimeError):
+    """A stop was requested while this file was being scored.
+
+    Nothing is written for it: a file is committed once, by rename, at the end, so the
+    articles already scored here are dropped and the next pass starts the file cleanly.
+    That is what makes a stop take one article's request instead of one file's worth.
+    """
+
+
 def _symbol_matches_file(symbol: str, stem: str) -> bool:
     """Whether the payload's symbol is the one the filename names.
 
@@ -148,6 +157,7 @@ def process_file(
     dry_run: bool = False,
     verbose: bool = False,
     log_dir: Optional[Path] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> Outcome:
     """Trim, score and commit one marked file.
 
@@ -196,6 +206,10 @@ def process_file(
         verdicts = {}
         failures: List[Tuple[str, str]] = []
         for position, article in enumerate(targets, 1):
+            # Between articles, not between files: this is what makes a stop land in
+            # seconds. The file stays marked and is rescored in full by the next pass.
+            if should_stop is not None and should_stop():
+                raise FileStopped(name)
             try:
                 verdict = strata.score_article(article, model=model)
             except strata.StrataDown:
@@ -306,6 +320,8 @@ def process_file(
         outcome.seconds = time.monotonic() - started
         _log_outcome(outcome, log_dir=log_dir)
         return outcome
+    except FileStopped:
+        raise
     except Exception as exc:  # noqa: BLE001 - one bad file must not stop the run
         outcome.error = f"{type(exc).__name__}: {exc}"
         outcome.seconds = time.monotonic() - started
@@ -530,7 +546,14 @@ def _run_locked(    candidates: Sequence[Path],
                 dry_run=dry_run,
                 verbose=verbose,
                 log_dir=log_dir,
+                should_stop=should_stop,
             )
+        except FileStopped:
+            store.append_log(
+                f"{store.iso(store.now_utc())} stopped by request; {path.name} left for the next pass",
+                log_dir=log_dir,
+            )
+            break
         except strata.StrataDown as exc:
             store.append_log(
                 f"{store.iso(store.now_utc())} aborted reason={json.dumps(f'strata stopped answering: {exc}')} "
