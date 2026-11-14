@@ -24,6 +24,7 @@ import pytest
 import config
 import curation
 import relevance
+import service
 import sentiment_worker
 import store
 import strata
@@ -864,3 +865,57 @@ class TestFreshWork:
         )
 
         assert fresh == [path]
+
+class TestIdleStop:
+    """Only a Strata this worker started is ever stopped, and only after a quiet spell."""
+
+    @staticmethod
+    def supervisor():
+        return service.Supervisor("SentimentWorker", 120.0)
+
+    def test_a_strata_this_worker_did_not_start_is_never_stopped(self):
+        svc = self.supervisor()
+
+        assert not svc._strata_idle_expired(False, time.monotonic() - 60 * 60)
+
+    def test_no_idle_clock_means_nothing_to_stop(self):
+        assert not self.supervisor()._strata_idle_expired(True, None)
+
+    def test_a_recent_pass_keeps_it_running(self):
+        assert not self.supervisor()._strata_idle_expired(True, time.monotonic() - 5)
+
+    def test_two_quiet_minutes_stop_it(self):
+        svc = self.supervisor()
+
+        assert svc._strata_idle_expired(True, time.monotonic() - (service.STRATA_IDLE_STOP_S + 1))
+
+
+class TestFreshWorkAtServiceLevel:
+    """The loop's own view: an empty queue is never fresh work."""
+
+    @staticmethod
+    def supervisor():
+        return service.Supervisor("SentimentWorker", 120.0)
+
+    def test_an_empty_queue_is_not_fresh_work(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "SENTIMENT_DIR", tmp_path)
+
+        assert self.supervisor()._fresh_work(object()) is False
+
+    def test_a_new_pending_file_is_fresh_work(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(config, "SENTIMENT_DIR", tmp_path)
+        pending = tmp_path / "AAA.us.new.json"
+        pending.write_text("{}", encoding="utf-8")
+        queued = [pending]
+
+        class Worker:
+            @staticmethod
+            def fresh_work(candidates, failures):
+                return queued
+
+            class store:
+                @staticmethod
+                def load_failures():
+                    return {}
+
+        assert self.supervisor()._fresh_work(Worker) is True
