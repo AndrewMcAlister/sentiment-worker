@@ -46,6 +46,12 @@ FINISHED_SUFFIX = ".json"
 FAILED_STATE = "Failed"
 FAILED_SUFFIX = SEPARATOR + FAILED_STATE + SEPARATOR + FINISHED_STATE
 
+#: How long a stop request lets the file in flight finish and be written. A file's scores
+#: are written once, at the end, so abandoning one wastes everything scored in it; but a
+#: stop must not look hung either. Past this, the file is abandoned whole and the next
+#: pass rescores it from scratch.
+STOP_GRACE_S = 30.0
+
 # Derived from the three states rather than written out again: the parts are the single
 # source, and these are the spellings the rest of the code compares against. Keeping them
 # as names means a call site reads `.pending.json` without repeating a literal.

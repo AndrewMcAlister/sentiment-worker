@@ -107,9 +107,10 @@ class FileFailed(RuntimeError):
 class FileStopped(RuntimeError):
     """A stop was requested while this file was being scored.
 
-    Nothing is written for it: a file is committed once, by rename, at the end, so the
-    articles already scored here are dropped and the next pass starts the file cleanly.
-    That is what makes a stop take one article's request instead of one file's worth.
+    A stop is a request, not a kill: the file in flight gets config.STOP_GRACE_S to
+    finish and be written, because its scores are only written once, at the end. Past
+    that it is abandoned whole - nothing is written, the file keeps its bytes and its
+    .new.json name, and the next pass rescores it from scratch.
     """
 
 
@@ -167,6 +168,7 @@ def process_file(
     marked file untouched.
     """
     started = time.monotonic()
+    stop_seen_at = None      # monotonic, set the first time a stop is noticed
     name = Path(path).name
     # The ticker only: the country code is part of the filename, not of the payload, and
     # comparing "BAC" against "BAC.us" is what the guard rightly refused.
@@ -206,10 +208,14 @@ def process_file(
         verdicts = {}
         failures: List[Tuple[str, str]] = []
         for position, article in enumerate(targets, 1):
-            # Between articles, not between files: this is what makes a stop land in
-            # seconds. The file stays marked and is rescored in full by the next pass.
+            # Between articles, not between files: the file keeps going for up to
+            # STOP_GRACE_S after a stop is noticed, so a file that is nearly done is
+            # written rather than thrown away. Past the grace it is abandoned whole.
             if should_stop is not None and should_stop():
-                raise FileStopped(name)
+                if stop_seen_at is None:
+                    stop_seen_at = time.monotonic()
+                if time.monotonic() - stop_seen_at >= config.STOP_GRACE_S:
+                    raise FileStopped(name)
             try:
                 verdict = strata.score_article(article, model=model)
             except strata.StrataDown:

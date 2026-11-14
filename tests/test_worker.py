@@ -1004,13 +1004,33 @@ class TestGateHonoursStop:
         assert clock.now < config.STRATA_LOAD_WAIT_SECONDS, "it should not wait the full window"
 
 class TestStopMidFile:
-    """A stop lands between articles, and leaves the file it abandoned untouched."""
+    """A stop gives the file in flight a grace window, then abandons what is left of it."""
 
-    def test_a_stop_while_scoring_leaves_the_file_marked(self, sandbox, monkeypatch):
+    def test_a_file_that_finishes_within_the_grace_is_written(self, sandbox, monkeypatch):
+        # The common case: the file is a few articles from done, so stopping would throw the
+        # scoring away. The grace lets it land, and only then does the pass end.
+        pending = make_pending("BAC.json", sandbox.data)
+        monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
+        monkeypatch.setattr(strata, "score_article", fake_model())
+
+        outcome = sentiment_worker.process_file(
+            pending,
+            model="test-model",
+            now=store.now_utc(),
+            should_stop=lambda: True,
+        )
+
+        assert outcome.ok, "a stop must not turn a finished file into a failure"
+        finished = sandbox.data / config.finished_name(pending.name)
+        assert finished.is_file(), "the finished file is written"
+        assert not pending.exists(), "and the marked name is gone"
+
+    def test_a_file_that_outlasts_the_grace_is_abandoned(self, sandbox, monkeypatch):
         pending = make_pending("BAC.json", sandbox.data)
         before = digest(pending)
         monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
         monkeypatch.setattr(strata, "score_article", fake_model())
+        monkeypatch.setattr(config, "STOP_GRACE_S", 0.0)   # the grace has run out
 
         with pytest.raises(sentiment_worker.FileStopped):
             sentiment_worker.process_file(
@@ -1028,6 +1048,7 @@ class TestStopMidFile:
         pending = make_pending("BAC.json", sandbox.data)
         monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
         monkeypatch.setattr(strata, "score_article", fake_model())
+        monkeypatch.setattr(config, "STOP_GRACE_S", 0.0)
         checks = {"count": 0}
 
         def stop() -> bool:
