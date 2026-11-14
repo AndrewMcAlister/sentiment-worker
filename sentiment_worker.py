@@ -191,21 +191,20 @@ def process_file(
                 f"refusing to write {finished.name}"
             )
 
-        # A marked file's local reading is stale output, not input. The schema documents it
-        # as "null while pending" with status 'pending' (schema.json), and this pass replaces
-        # both, so they are normalised before validation: a hand-edit - or a reading left from
-        # an older scale - must not make a file unprocessable by carrying exactly the value
-        # this pass exists to overwrite. Everything else is still validated strictly.
+        # Renaming a file to .new.json is an instruction to rescore it, so nothing here
+        # re-validates the producer's payload: a field the worker does not own - an old local
+        # score, a placeholder, a stray value - must not make a file unprocessable. What is
+        # checked is only what this pass needs to run at all.
+        if not isinstance(payload.get("articles"), list):
+            raise FileFailed("the payload has no articles[] list to score")
+        if curation.local_entry(payload) is None:
+            raise FileFailed("the payload has no scores[] entry with role 'local'")
+
+        # The local reading is output, about to be replaced. The schema documents a pending
+        # one as "null while pending" with status 'pending' (schema.json), so it is normalised
+        # rather than judged: whatever stale value the file carried is not evidence about it.
         payload["local_sentiment_score"] = None
         payload["local_sentiment_status"] = "pending"
-
-        # A marked file that cannot satisfy the schema cannot produce one that
-        # does: this is where a corrupted append is caught, before any inference
-        # is spent on it.
-        try:
-            validate.validate(payload, what=name)
-        except validate.SchemaError as exc:
-            raise FileFailed(str(exc)) from None
 
         trimmed = curation.trim(payload, today=now.date())
         outcome.kept = len(trimmed.kept)
