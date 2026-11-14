@@ -310,7 +310,7 @@ def stop_service(name: str = SERVICE_NAME, timeout: float = 900) -> dict:
         advapi32.CloseServiceHandle(scm)
 
 
-def ensure_strata() -> dict:
+def ensure_strata(should_stop=None) -> dict:
     """Make sure a Strata is answering, without ever competing with one that is loading.
 
     The rule - port first, then a fresh starting flag means wait, and only then start - lives
@@ -320,7 +320,8 @@ def ensure_strata() -> dict:
     """
     import strata  # noqa: PLC0415 - imported where it is used, like the worker is
 
-    return strata.ensure(start=lambda: start_service("Strata"), log=log, wait_seconds=180.0)
+    return strata.ensure(start=lambda: start_service("Strata"), log=log, wait_seconds=180.0,
+                        should_stop=should_stop)
 
 
 def delete_service(name: str = SERVICE_NAME) -> None:
@@ -494,7 +495,7 @@ class Supervisor:
                 # There is work a model could change and nothing is listening. The gate waits
                 # for a Strata that is already loading and starts the service only when nothing
                 # is happening at all, so this never competes with a load in flight.
-                outcome = ensure_strata()
+                outcome = ensure_strata(should_stop=self.stop_event.is_set)
                 log(f"strata was down and there is fresh work: {outcome.get('action')}")
                 if outcome.get("action") == "started":
                     started_here = True

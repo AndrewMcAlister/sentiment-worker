@@ -141,6 +141,7 @@ def ensure(
     log: Optional[Callable[[str], None]] = None,
     wait_seconds: Optional[float] = None,
     poll_seconds: Optional[float] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     """Make sure *some* Strata is answering, without competing with one that is loading.
 
@@ -172,10 +173,15 @@ def ensure(
     if listen():
         return {"action": "in-use"}
 
+    def halted() -> bool:
+        return should_stop is not None and should_stop()
+
     if starting_flag_is_fresh():
         log("a Strata is starting; waiting for its port instead of starting a second one")
         deadline = clock() + wait
         while clock() < deadline:
+            if halted():
+                return {"action": "stopped"}
             sleep(poll)
             if listen():
                 return {"action": "waited"}
@@ -195,6 +201,8 @@ def ensure(
 
     deadline = clock() + wait
     while clock() < deadline:
+        if halted():
+            return {"action": "stopped", "detail": outcome}
         if listen():
             return {"action": "started", "detail": outcome}
         sleep(poll)

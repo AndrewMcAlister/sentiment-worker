@@ -150,10 +150,20 @@ def test_a_sanitised_symbol_still_matches_its_filename():
 
 
 def test_every_live_file_matches_the_schema():
-    """The schema has to describe the files that already exist, not an idea."""
+    """The schema has to describe the files the pipeline has finished, not an idea.
+
+    Pending files are excluded because they have not been scored yet - the producer writes a
+    placeholder score - and Failed files are excluded because they are the recorded evidence
+    that a file did NOT validate. Judging either would make this test a report on whatever
+    landed in the folder most recently rather than on the schema the pipeline promises.
+    """
     if not LIVE.is_dir():
         pytest.skip("the live sentiment directory is not present")
-    files = sorted(LIVE.glob("*.json"))
+    files = sorted(
+        path
+        for path in LIVE.glob("*.json")
+        if not config.is_pending(path.name) and not config.is_failed(path.name)
+    )
     assert files, "no live files to check"
     problems = []
     for path in files:
@@ -955,3 +965,40 @@ class TestFailedNaming:
     def test_a_missing_file_does_not_raise(self, tmp_path):
         # Lost between discovery and the failure: the pass must survive it.
         sentiment_worker.mark_failed(tmp_path / "GONE.us.new.json", "nope", log_dir=tmp_path)
+
+class TestGateHonoursStop:
+    """A service stop must not wait out the gate's 180 s port wait."""
+
+    class Clock:
+        def __init__(self) -> None:
+            self.now = 0.0
+
+        def clock(self) -> float:
+            return self.now
+
+        def sleep(self, seconds: float) -> None:
+            self.now += seconds
+
+    def test_a_stop_request_ends_the_wait(self, tmp_path, monkeypatch):
+        flag = tmp_path / "strata.starting"
+        flag.write_text('{"pid": 1}', encoding="utf-8")
+        monkeypatch.setattr(config, "STRATA_STARTING_FLAG", str(flag))
+        clock = self.Clock()
+        started = []
+        looks = {"count": 0}
+
+        def listen() -> bool:
+            looks["count"] += 1
+            return False  # nothing ever binds
+
+        outcome = strata.ensure(
+            listen=listen,
+            start=lambda: started.append(1),
+            sleep=clock.sleep,
+            clock=clock.clock,
+            should_stop=lambda: looks["count"] >= 2,
+        )
+
+        assert outcome["action"] == "stopped"
+        assert started == [], "a stop must not leave a start behind"
+        assert clock.now < config.STRATA_LOAD_WAIT_SECONDS, "it should not wait the full window"
