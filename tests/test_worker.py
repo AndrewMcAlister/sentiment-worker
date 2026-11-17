@@ -888,30 +888,6 @@ class TestFreshWork:
 
         assert fresh == [path]
 
-class TestIdleStop:
-    """Only a Strata this worker started is ever stopped, and only after a quiet spell."""
-
-    @staticmethod
-    def supervisor():
-        return service.Supervisor("SentimentWorker", 120.0)
-
-    def test_a_strata_this_worker_did_not_start_is_never_stopped(self):
-        svc = self.supervisor()
-
-        assert not svc._strata_idle_expired(False, time.monotonic() - 60 * 60)
-
-    def test_no_idle_clock_means_nothing_to_stop(self):
-        assert not self.supervisor()._strata_idle_expired(True, None)
-
-    def test_a_recent_pass_keeps_it_running(self):
-        assert not self.supervisor()._strata_idle_expired(True, time.monotonic() - 5)
-
-    def test_two_quiet_minutes_stop_it(self):
-        svc = self.supervisor()
-
-        assert svc._strata_idle_expired(True, time.monotonic() - (service.STRATA_IDLE_STOP_S + 1))
-
-
 class TestFreshWorkAtServiceLevel:
     """The loop's own view: an empty queue is never fresh work."""
 

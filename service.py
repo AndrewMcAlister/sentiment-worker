@@ -59,10 +59,7 @@ STRATA_RETRY_S = 300.0
 #: this is what lets a file dropped during a quiet spell be noticed in half a minute instead of
 #: after the old blind 300 s wait (which looked like the worker never saw it).
 STRATA_QUEUE_POLL_S = 30.0
-#: No fresh work for this long, and a Strata this worker started is stopped again. Only a
-#: service this worker started is ever stopped: an instance from a shortcut is not ours.
-STRATA_IDLE_STOP_S = 120.0
-#: How often the idle timer is checked while a pass waits for its next look.
+#: How often a pass checks whether it may stop, while it waits for its next look.
 STRATA_IDLE_POLL_S = 15.0
 
 ROOT = Path(os.path.abspath(__file__)).parent
@@ -452,18 +449,6 @@ class Supervisor:
         except Exception as exc:                          # noqa: BLE001 - an unanswered probe is "down"
             return False, f"{exc.__class__.__name__}: {exc}"
 
-    def _strata_idle_expired(self, started_here: bool, idle_since) -> bool:
-        """Whether a Strata this worker started has been idle long enough to stop."""
-        return (started_here and idle_since is not None
-                and (time.monotonic() - idle_since) >= STRATA_IDLE_STOP_S)
-
-    def _stop_strata(self) -> None:
-        log(f"no fresh work for {int(STRATA_IDLE_STOP_S)}s; stopping the Strata service this worker started")
-        try:
-            stop_service("Strata")
-        except ServiceError as exc:
-            log(f"could not stop Strata: {exc}")
-
     def run(self) -> None:
         os.chdir(ROOT)
         try:
@@ -474,21 +459,12 @@ class Supervisor:
         log(f"service starting: interval={int(self.interval)}s root={ROOT} python={sys.executable}")
         previous = None
         strata_away = False
-        started_here = False          # whether this worker started the Strata service
-        idle_since = None             # monotonic time at which fresh work last existed
         while not self.stop_event.is_set():
-            # Fresh work decides everything below: whether a stopped Strata is started, and
-            # whether one this worker started has earned a rest.
+            # Fresh work decides one thing below: whether a stopped Strata is started. The
+            # service is not stopped again when the queue empties -- switching its model is the
+            # desktop shortcut's job (Strata_Service.ps1 -Action Serve), and a service that
+            # stopped itself would only have to be woken for the next article.
             fresh = self._fresh_work(worker)
-            if fresh:
-                idle_since = None
-            elif idle_since is None:
-                idle_since = time.monotonic()
-
-            if self._strata_idle_expired(started_here, idle_since):
-                self._stop_strata()
-                started_here = False
-                strata_away = True
 
             up, detail = self._strata_up(worker)
             if not up and fresh:
@@ -497,8 +473,6 @@ class Supervisor:
                 # is happening at all, so this never competes with a load in flight.
                 outcome = ensure_strata(should_stop=self.stop_event.is_set)
                 log(f"strata was down and there is fresh work: {outcome.get('action')}")
-                if outcome.get("action") == "started":
-                    started_here = True
                 up, detail = self._strata_up(worker)
             if not up:
                 if not strata_away:
@@ -550,10 +524,6 @@ class Supervisor:
                 log(f"pass exit={code} in {elapsed:.1f}s; {state}; next pass in {int(wait_s)}s")
             wait_until = time.monotonic() + wait_s
             while not self.stop_event.is_set():
-                if self._strata_idle_expired(started_here, idle_since):
-                    self._stop_strata()
-                    started_here = False
-                    break
                 left = wait_until - time.monotonic()
                 if left <= 0:
                     break
