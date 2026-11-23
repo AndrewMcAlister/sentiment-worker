@@ -5,7 +5,7 @@ API is up. One pass over one file is a transaction: trim, score, validate,
 rename. Nothing else in `D:\sentiment-worker` writes to the sentiment directory.
 
 ```
-BAC.pending.json   ->  BAC.json
+BAC.new.json   ->  BAC.json
 ```
 
 ## The marker convention - three states, not two
@@ -20,14 +20,14 @@ The `.pending` -> `.new` rename is the handover: a file is either still being wr
 is complete, and the rename makes that atomic. Reading a `.pending` file would score a
 partial article list, so it is excluded by suffix rather than by age or a lock.
 
-To change the convention, edit the three constants in `config.py` - `WRITING_SUFFIX`,
-`PENDING_SUFFIX`, `FINISHED_SUFFIX` - and `config.finished_name()`, which is the single
+To change the convention, edit the three state constants in `config.py` - `WRITING_STATE`,
+`PENDING_STATE`, `FINISHED_STATE` - and `config.finished_name()`, which is the single
 place the rule is applied. `tests/test_worker.py::test_a_file_being_written_is_never_claimed`
 asserts all three states.
 
 ## What one pass does
 
-For every `*.pending.json` in `D:\temp\McTrader\Sentiment`:
+For every `*.new.json` in `D:\temp\McTrader\Sentiment`:
 
 1. **Trim.** Drop every article whose `published` is older than three calendar
    months, every article whose date is missing or unreadable (`undated`), and
@@ -53,12 +53,12 @@ For every `*.pending.json` in `D:\temp\McTrader\Sentiment`:
 | `scores[production]` | **never written.** Compared before and after the pass; a difference aborts the write. |
 | `sentiment_score`, `sentiment_status` | **never written.** These are the production (DeepSeek) reading, lifted from `scores[production]` by McTrader. |
 | `search_refreshed_utc` | **never written.** The collector's monthly search clock. Preserved so a curated file is not mistaken for one that was never searched; the collector re-searches when it is absent or 28 days old. |
-| `scores[local].label` | `Local — <the model id Strata reports>`, e.g. `Local — qwen3.8-flash-next-iq3_xxs` |
+| `scores[local].label` | `Local — <the model id the llama.cpp router reports as loaded>`, e.g. `Local — Qwen3-Next-80B-A3B-Instruct-Q4_K_M` |
 | `scores[local].score` / `local_sentiment_score` | the mean, 1-10 |
 | `scores[local].status` / `local_sentiment_status` | `ok`, or `no view` when nothing survived the trim |
 | `scores[local].reason` | a paragraph, composed from the readings (counts, range, weakest and strongest article) |
 | `scores[local].evidence` | up to ten lines, strongest opinion first |
-| `scores[local].basis` | `strata_local` |
+| `scores[local].basis` | `llama_local`. Files curated before llama.cpp replaced Strata keep `strata_local`; nothing in McTrader compares the value. |
 | `scores[local].as_of` | the date of the pass |
 | `scores[local].note` | left as it was (`comparison only; never priced`) |
 | `comparison` | `vs production: equal` / `vs production: +1.5` / `vs production: not comparable` — the format McTrader's own worker writes |
@@ -69,33 +69,39 @@ For every `*.pending.json` in `D:\temp\McTrader\Sentiment`:
 
 ## Is the schema enforced before every write?
 
-Yes, at four points, and the write does not happen if any of them fails:
+Yes, and the write does not happen if any of these fails:
 
-1. the **input** marked file is validated (a corrupt file is never judged);
-2. the **curated payload** is validated in memory;
-3. the **bytes on disk** in the temporary file are parsed and validated;
-4. the **production guard** compares `sentiment_score`, `sentiment_status` and
+1. the **curated payload** is validated in memory;
+2. the **bytes on disk** in the temporary file are parsed back and validated;
+3. the **production guard** compares `sentiment_score`, `sentiment_status` and
    `scores[production]` before and after — any change aborts the write.
+
+The **input** marked file is deliberately not schema-validated. Renaming a file
+to `.new.json` is an instruction to rescore it, so a stale local score or a
+producer's placeholder must not make it unprocessable. The pass checks only what
+it needs to run: that `articles[]` is a list and that a `scores[local]` entry
+exists. Unreadable JSON fails before any model call.
 
 `schema.json` sets `additionalProperties: false` at the root, in every `scores[]`
 entry and in every `articles[]` entry. It was written from the live corpus: the
-test `test_every_live_file_matches_the_schema` validates all 94 real files against
-it, so it describes what the files are rather than what they should be. Two
-article fields the current McTrader writer emits but the 2026-10-18 corpus does
-not carry (`snippet`, `body`) are declared optional and preserved when present.
+test `test_every_live_file_matches_the_schema` validates every finished file in
+the live directory against it (94 when the schema was written), so it describes
+what the files are rather than what they should be. Two article fields the
+current McTrader writer emits but the 2026-10-18 corpus does not carry
+(`snippet`, `body`) are declared optional and preserved when present.
 
 ## What happens when something fails
 
 | failure | effect on the marked file | what you see |
 |---|---|---|
-| McTrader's API is down (`/openapi.json` not 200) | none — the pass never starts | **nothing at all**, no log line |
-| no marked files | none | nothing at all |
-| another pass holds the lock | none | nothing at all (the task is also `IgnoreNew`) |
-| **Strata is down while files are pending** | **none — they queue.** Nothing is touched, renamed, deleted or annotated; every tick tries again, forever | one line, `strata_unavailable pending=N`, at most once an hour |
-| Strata dies mid-pass | none for the current file and the rest | one `aborted` line, then the throttled `strata_unavailable` |
-| fewer than half of a file's articles could be scored | none | one `FAILED` line, and `state/failures.json` |
-| the marked file is corrupt or names another symbol | none, byte-for-byte | one `FAILED` line, and `state/failures.json` |
-| the file changed while it was being judged | none (the pass abandons it) | one `FAILED` line |
+| McTrader's API is down (`/openapi.json` not 200) | none — the pass never starts | no worker-log line (the service log still records the pass) |
+| no marked files | none | one `poll files=0` heartbeat line |
+| another pass holds the lock | none | one `poll files=N` line, then nothing (the task is also `IgnoreNew`) |
+| **llama-server is down while files are pending** | **none — they queue.** Nothing is touched, renamed, deleted or annotated; every tick tries again, forever | a `poll files=N` heartbeat each pass, plus `llama_unavailable pending=N` at most once an hour |
+| llama-server dies mid-pass | none for the current file and the rest | one `aborted` line, then the throttled `llama_unavailable` |
+| fewer than half of a file's articles could be scored | contents unchanged; renamed to `<SYMBOL>.<cc>.Failed.json` | one `FAILED` line, and `state/failures.json` |
+| the marked file is corrupt or names another symbol | contents unchanged; renamed to `<SYMBOL>.<cc>.Failed.json` | one `FAILED` line, and `state/failures.json` |
+| the file changed while it was being judged | contents unchanged; renamed to `<SYMBOL>.<cc>.Failed.json` | one `FAILED` line |
 | the process is killed mid-run | the marked file is intact; at worst one file is already finished | the lock is gone (OS byte lock), the next tick carries on |
 
 A marked file is **never deleted** and never rewritten on failure. On success the
@@ -105,20 +111,29 @@ the two names.
 
 ## How it is started
 
-`SentimentWorker` is a Windows service, **demand-start**, and it declares a dependency
-on `Strata`. That combination is the point:
+`SentimentWorker` is a Windows service, **demand-start**, with **no service dependency**.
+`llama-server` is an independent Automatic service; this worker probes it on every pass and
+queues files while it is away, but it never starts or stops it.
 
-- starting it starts the Strata model server first (`sc start SentimentWorker`);
-- McTrader's start scripts start it, so it comes up with the trading system rather than at
-  boot (`scripts\StartMcTraderHeadless.ps1` for the boot task, `scripts\StartMcTrader.bat`
-  for the interactive one - the latter needs Administrator, and says so when it cannot);
-- because Strata has a dependent service, the SCM refuses to stop Strata while the worker
-  is running. Stop the worker first: `scripts\StopMcTrader.bat` does exactly that, before
-  it stops anything else, and refuses to report a clean stop if the worker survived.
+- McTrader's start scripts start the worker, so it comes up with the trading system rather
+  than at boot (`scripts\StartMcTraderHeadless.ps1` for the boot task,
+  `scripts\StartMcTrader.bat` for the interactive one - the latter needs Administrator,
+  and says so when it cannot);
+- stopping the worker is independent of the model server: either one can be restarted, and
+  "stop the worker, load a different preset" is normal because the next pass reads the
+  router's loaded model id;
+- `scripts\StopMcTrader.bat` stops the worker first, so the stop lands between files: the
+  file in flight finishes and is written, and the rest wait for the next pass.
 
 It can also be started by hand from services.msc or Task Manager. A reinstall keeps the
 demand start type (`service.py install`), so a reinstall cannot quietly put it back into
 the boot path.
+
+A service installed before the llama.cpp switch still carries the old display name and
+may still declare the retired dependency; `CreateService` only names a service once.
+Repair it with an elevated `service.ps1 -Action Uninstall` followed by
+`service.ps1 -Action Install` (the same `--interval` if it was not 300). `install` also
+writes `depend=` explicitly, which is the only way to clear an old dependency.
 
 ## The scheduled task
 
@@ -170,23 +185,25 @@ McTrader gate; there is no flag that skips the schema.
 
 | path | content |
 |---|---|
-| `logs\worker-YYYY-MM-DD.log` | one line per file: timestamp, symbol, `score=`, `status=`, `kept=`, `dropped=`, `scored=`, `targets=`, `secs=`; plus `FAILED`/`aborted`/`strata_unavailable` lines when something went wrong |
+| `logs\worker-YYYY-MM-DD.log` | a `poll files=N` heartbeat per pass, a `processing` line per file, then one outcome line per file: timestamp, symbol, `score=`, `status=`, `kept=`, `dropped=`, `scored=`, `targets=`, `secs=`; plus `FAILED`/`aborted`/`llama_unavailable` lines when something went wrong |
 | `state\failures.json` | per-symbol attempt count and last error, for files that have failed |
 | `state\worker.lock` | present only while a pass runs; removed on a clean exit, and released by the OS if the process dies |
 | `state\baseline-live-files.csv` | SHA-256 of the 94 live files as they were before this worker existed |
-| `state\backup-before-first-run\` | a byte-identical copy of every file that was marked pending when the task was installed, so a curated file can be compared with (or restored to) what the search wrote |
+| `state\backup-before-first-run\` | a byte-identical copy of every file that was marked `.new.json` when the task was installed, so a curated file can be compared with (or restored to) what the search wrote |
 
 ## Measured cost
 
-On the engine that was running when this was built (`qwen3.8-flash-next-iq3_s`):
-**3.8-4.0 s per article**, `cached_tokens` 0 on every call, so a 15-article file
-is **44-55 s** and a 2-article file **6.6 s**; the 94-file queue is therefore
-about **75-90 minutes**. That is why the work is one file at a time with a
-per-file transaction, and why the task is `IgnoreNew`.
+On the loaded `Qwen3-Next-80B-A3B-Instruct-Q4_K_M` (measured 2026-11-24):
+**8.1 s for a 118-token prompt** (prefill 15.5 tok/s, generation 18.2 tok/s), so a
+900-character article is roughly 20 s. `config.REQUEST_TIMEOUT_SECONDS` is three
+minutes, which also covers a request queued behind another user of the shared router.
+That is why the work is one article at a time with a per-file transaction, and why the
+task is `IgnoreNew`.
 
-The model id is read from `/v1/models` on every pass and written into the label;
-it changed under this worker once (`…-iq3_s` to `…-iq3_xxs`) and the label
-followed without a code change.
+The model id is read from the router's `/v1/models` on every pass - the entry whose
+`status.value` is `loaded` - and written into the label. `config.LLAMA_MODEL` is only
+the fallback for a router with nothing loaded; normally the name in the file is the
+model that actually answered.
 
 ## Trim, measured over the 94 live files (1,836 articles)
 
@@ -233,7 +250,7 @@ already finished stays finished.
 ## Tests
 
 ```powershell
-& $py -m pytest D:\sentiment-worker\tests -q     # 41 tests, no network, no live files written
+& $py -m pytest D:\sentiment-worker\tests -q     # 93 tests, no network, no live files written
 ```
 
 The fixtures are byte-identical copies of `BAC.json`, `ABBV.json` and `ADBE.json`;
@@ -243,10 +260,10 @@ articles that exercise exactly one trim rule. Nothing in the suite writes to
 
 ## Decisions worth knowing
 
-- **The client is imported, not forked.** `strata.py` imports
-  `D:\news-sentiment\sentiment.py` and calls its `score()`, so the
-  `chat_template_kwargs: {"enable_thinking": false}` request, the null-content
-  refusal and the strict parser are the measured ones. Its `-1..+1` verdict is
+- **The client is self-contained.** `llama_client.py` sends the measured request
+  (`chat_template_kwargs: {"enable_thinking": false}`, `temperature: 0`, a 16-token
+  cap), refuses null content and parses `LABEL|SCORE|CONFIDENCE` strictly. The model
+  id comes from the router's loaded entry, not a constant; its `-1..+1` verdict is
   mapped to 1-10 by a fixed linear map rather than sending a second prompt shape
   (a second system prompt would miss the prefix cache).
 - **The reason is composed, not generated.** It is built from the readings that
@@ -262,10 +279,13 @@ articles that exercise exactly one trim rule. Nothing in the suite writes to
 - **Only the newest 15 kept articles are scored.** A file that keeps 18 scores 15
   and keeps all 18; the three unscored ones carry no new score.
 - **No per-article retry.** A failed article counts as failed; a file with fewer
-  than half its articles scored is not written at all, and the next tick tries
-  again.
-- **McTrader's own `root.sentiment_worker` also matches `*.pending.json`** with
-  its `*.json` glob. It skips them today because their local status is terminal
-  (`ok`/`no view`/`not requested`), and it will skip a curated file too
-  (`ok`). The two workers never write the same file at the same time in
-  practice, but they both write `BAC.json` if both act on the same symbol.
+  than half its articles scored is not written. It is renamed to
+  `<SYMBOL>.<cc>.Failed.json` (contents unchanged), so retrying is an explicit
+  rename back. A server that stops answering is different: that aborts the pass
+  and leaves the file marked for the next tick.
+- **McTrader's own `root.sentiment_worker` leaves the marked names alone.** Its
+  `*.json` glob also matches `*.new.json` and `*.pending.json`, but it excludes
+  both by name; it only takes a finished `<SYMBOL>.<cc>.json` whose local status
+  is not terminal. A curated file is skipped because its status is `ok`/`no view`.
+  The two workers never write the same file at the same time in practice, but
+  they both write `BAC.json` if both act on the same symbol.

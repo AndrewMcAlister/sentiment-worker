@@ -16,20 +16,19 @@ that dies leaves nothing to see.  A service is in services.msc, can be started a
 and its state is the SCM's.  The scheduled task may stay enabled or be removed; the worker's
 own instance lock keeps two passes from overlapping either way.
 
-Why ctypes and not pywin32: this machine has no pywin32, and Strata's own service
-(Strata\\Scripts\\Strata_Service.py) already talks to the SCM this way, so the same approach
-is used here and nothing extra is installed.
+Why ctypes and not pywin32: this machine has no pywin32, and the SCM calls needed here are a
+small, fixed set, so they are declared directly and nothing extra is installed.
 
-What it does about Strata: nothing special, and that is deliberate.  ``sentiment_worker.run``
-checks Strata before it scores, logs ``strata_unavailable`` and leaves the files marked, so a
-model server that stops and starts under the service simply costs passes, not files.
+What it does about llama-server: nothing special, and that is deliberate.
+``sentiment_worker.run`` checks the model server before it scores, logs
+``llama_unavailable`` and leaves the files marked, so a server that stops and starts under
+the service simply costs passes, not files.
 
-The service is DEMAND_START and declares NO dependency on Strata.  It waits on its own for the
-model to answer (see above), so the two are independent in both directions: Strata can be stopped
-or restarted while this runs, and McTrader's start scripts start Strata first, then this.  A
-dependency would make the SCM refuse to stop Strata while this service runs - which is exactly
-the thing that must not happen, because "stop the service, load a different model" is a normal
-thing to do in the middle of the day.
+The service is DEMAND_START and declares NO dependency on llama-server.  It waits on its own
+for the model to answer (see above), so the two are independent in both directions: the model
+server can be stopped or restarted while this runs, and "stop the worker, load a different
+model" is a normal thing to do in the middle of the day.  A dependency would make the SCM
+refuse to stop llama-server while this service runs.
 """
 
 from __future__ import annotations
@@ -45,22 +44,18 @@ import time
 from pathlib import Path
 
 SERVICE_NAME = "SentimentWorker"
-DISPLAY_NAME = "Strata Sentiment Worker"
+DISPLAY_NAME = "Sentiment Curation Worker"
 DESCRIPTION = ("Scores the marked sentiment files in D:\\temp\\McTrader\\Sentiment with the "
-               "local Strata model, one pass every few minutes.")
-DEPENDENCY = ""                             # none: Strata is stopped and restarted independently
+               "loaded local llama.cpp model, one pass every few minutes.")
+DEPENDENCY = ""                  # none: llama-server is stopped and restarted independently
 DEFAULT_INTERVAL = 300.0
-#: While Strata is away there is nothing to do but wait: no pass is attempted (a pass could
-#: only log that the model is missing), and the service checks back on this slower cadence
-#: rather than the working interval.  One line is written when it goes away and one when it
-#: comes back - not one per check.
-STRATA_RETRY_S = 300.0
-#: How often the queue is looked at while Strata is away. The model is not probed that often;
-#: this is what lets a file dropped during a quiet spell be noticed in half a minute instead of
-#: after the old blind 300 s wait (which looked like the worker never saw it).
-STRATA_QUEUE_POLL_S = 30.0
+#: While llama-server is away there is nothing to do but wait: no pass is attempted (a pass
+#: could only log that the model is missing), and the service checks back on this slower
+#: cadence rather than the working interval.  One line is written when it goes away and one
+#: when it comes back - not one per check.
+LLAMA_QUEUE_POLL_S = 30.0
 #: How often a pass checks whether it may stop, while it waits for its next look.
-STRATA_IDLE_POLL_S = 15.0
+LLAMA_IDLE_POLL_S = 15.0
 
 ROOT = Path(os.path.abspath(__file__)).parent
 SERVICE_SCRIPT = Path(os.path.abspath(__file__))
@@ -307,20 +302,6 @@ def stop_service(name: str = SERVICE_NAME, timeout: float = 900) -> dict:
         advapi32.CloseServiceHandle(scm)
 
 
-def ensure_strata(should_stop=None) -> dict:
-    """Make sure a Strata is answering, without ever competing with one that is loading.
-
-    The rule - port first, then a fresh starting flag means wait, and only then start - lives
-    in ``strata.ensure``.  This function is what it may call to start one: service control is
-    this module's job, not the worker's, and the worker is handed it as a callable so it never
-    imports this module (which imports the worker).
-    """
-    import strata  # noqa: PLC0415 - imported where it is used, like the worker is
-
-    return strata.ensure(start=lambda: start_service("Strata"), log=log, wait_seconds=180.0,
-                        should_stop=should_stop)
-
-
 def delete_service(name: str = SERVICE_NAME) -> None:
     scm = _open_scm(SC_MANAGER_ALL_ACCESS)
     service = None
@@ -403,32 +384,6 @@ class Supervisor:
         import sentiment_worker                          # noqa: PLC0415 - only under the SCM or `run`
         return sentiment_worker
 
-    def _pending_paths(self):
-        """The marked files waiting now, as paths, or [] when they cannot be listed."""
-        try:
-            import config as worker_config                # noqa: PLC0415 - imported with the worker
-            import store                                  # noqa: PLC0415
-            return list(store.discover(Path(worker_config.SENTIMENT_DIR)))
-        except Exception as exc:                          # noqa: BLE001 - a count must never stop the loop
-            log(f"cannot list the queued files: {exc.__class__.__name__}: {exc}")
-            return []
-
-    def _fresh_work(self, worker):
-        """Whether the queue holds any pending file.
-
-        Pending is the whole test. A file that cannot be processed is renamed to the Failed
-        state and leaves the queue, so anything still in it is work the operator or the
-        producer put there - including a file renamed back from Failed to be rescored.
-        """
-        pending = self._pending_paths()
-        if not pending:
-            return False
-        try:
-            return bool(worker.fresh_work(pending, worker.store.load_failures()))
-        except Exception as exc:                          # noqa: BLE001 - an unknown queue is not work
-            log(f"cannot judge the queue: {exc.__class__.__name__}: {exc}")
-            return False
-
     def _pending_names(self):
         """The marked files waiting now, by name, or None when they cannot be listed."""
         try:
@@ -439,10 +394,10 @@ class Supervisor:
             log(f"cannot count the queued files: {exc.__class__.__name__}: {exc}")
             return None
 
-    def _strata_up(self, worker):
-        """(is Strata answering, why not) - never raises."""
+    def _llama_up(self, worker):
+        """(is llama-server answering, why not) - never raises."""
         try:
-            result = worker.strata_is_up()
+            result = worker.llama_is_up()
             if isinstance(result, tuple):
                 return bool(result[0]), (str(result[1]) if len(result) > 1 else "")
             return bool(result), ""
@@ -458,41 +413,28 @@ class Supervisor:
             return
         log(f"service starting: interval={int(self.interval)}s root={ROOT} python={sys.executable}")
         previous = None
-        strata_away = False
+        llama_away = False
         while not self.stop_event.is_set():
-            # Fresh work decides one thing below: whether a stopped Strata is started. The
-            # service is not stopped again when the queue empties -- switching its model is the
-            # desktop shortcut's job (Strata_Service.ps1 -Action Serve), and a service that
-            # stopped itself would only have to be woken for the next article.
-            fresh = self._fresh_work(worker)
-
-            up, detail = self._strata_up(worker)
-            if not up and fresh:
-                # There is work a model could change and nothing is listening. The gate waits
-                # for a Strata that is already loading and starts the service only when nothing
-                # is happening at all, so this never competes with a load in flight.
-                outcome = ensure_strata(should_stop=self.stop_event.is_set)
-                log(f"strata was down and there is fresh work: {outcome.get('action')}")
-                up, detail = self._strata_up(worker)
+            up, detail = self._llama_up(worker)
             if not up:
-                if not strata_away:
+                if not llama_away:
                     # The queue is looked at far more often than the model is probed: a file
-                    # that landed while Strata was away used to wait for the next 300 s check,
-                    # which looked exactly like the worker never noticing it.
-                    log(f"strata is not answering ({detail}); checking the queue every {int(STRATA_QUEUE_POLL_S)}s")
-                    strata_away = True
-                if self.stop_event.wait(STRATA_QUEUE_POLL_S):
+                    # that landed while llama-server was away used to wait for the next 300 s
+                    # check, which looked exactly like the worker never noticing it.
+                    log(f"llama-server is not answering ({detail}); checking the queue every {int(LLAMA_QUEUE_POLL_S)}s")
+                    llama_away = True
+                if self.stop_event.wait(LLAMA_QUEUE_POLL_S):
                     break
                 continue
-            if strata_away:
-                log("strata is answering again; resuming passes")
-                strata_away = False
+            if llama_away:
+                log("llama-server is answering again; resuming passes")
+                llama_away = False
             started = time.monotonic()
             try:
                 # stop_event is handed in so a stop lands between files instead of after the
                 # whole pass: the pass used to run to its end, which is what "Stop Pending"
                 # meant on 2026-11-11 (297 s).
-                code = worker.run(should_stop=self.stop_event.is_set, ensure_strata=ensure_strata)
+                code = worker.run(should_stop=self.stop_event.is_set)
             except BaseException as exc:                 # noqa: BLE001 - a watchdog must not die
                 log(f"pass raised {exc.__class__.__name__}: {exc}")
                 code = 1
@@ -527,7 +469,7 @@ class Supervisor:
                 left = wait_until - time.monotonic()
                 if left <= 0:
                     break
-                if self.stop_event.wait(min(left, STRATA_IDLE_POLL_S)):
+                if self.stop_event.wait(min(left, LLAMA_IDLE_POLL_S)):
                     break
         log("stop requested; exiting after the pass in flight")
 
@@ -592,12 +534,12 @@ def command_install(args) -> int:
     bin_path = f'"{python}" "{SERVICE_SCRIPT}" run --interval {int(interval)} --name {args.name}'
     register_service(args.name, bin_path)
     # Always write the dependency list, even when it is empty.  `sc config depend=` is the
-    # only way to clear one, and a service that was once installed with `depend= Strata`
-    # keeps it forever otherwise: the SCM then starts Strata before this service, which made
+    # only way to clear one, and a service installed with an obsolete dependency keeps it
+    # forever otherwise: the SCM would then start that service before this one, which made
     # "start the worker" look like "the worker woke the model".  Reinstalling is the repair.
     subprocess.run(["sc.exe", "config", args.name, "depend=", DEPENDENCY],
                    capture_output=True, timeout=15, check=False)
-    # A pass that dies should come back by itself: the worker tolerates Strata being down.
+    # A pass that dies should come back by itself: the worker tolerates llama-server being down.
     subprocess.run(["sc.exe", "failure", args.name, "reset=", "86400",
                     "actions=", "restart/5000/restart/30000/restart/60000"],
                    capture_output=True, timeout=15, check=False)

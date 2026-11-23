@@ -8,8 +8,9 @@
     MultipleInstancesPolicy = IgnoreNew so a long pass is never stacked on top
     of itself.
 
-    The worker itself decides whether there is anything to do: it exits silently
-    when McTrader's API is down or when no file is marked.
+    The worker itself decides whether there is anything to do: it exits before
+    writing anything when McTrader's API is down.  A pass with no marked file
+    writes only its `poll files=0` heartbeat.
 
 .PARAMETER Remove
     Unregister the task instead of creating it.
@@ -88,7 +89,7 @@ $start = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
 # operator says otherwise.
 $marked = 0
 if (Test-Path -LiteralPath $SentimentDir) {
-    $marked = @(Get-ChildItem -LiteralPath $SentimentDir -Filter '*.pending.json' -File).Count
+    $marked = @(Get-ChildItem -LiteralPath $SentimentDir -Filter '*.new.json' -File).Count
 }
 $taskEnabled = if ($Enable -or $marked -eq 0) { 'true' } else { 'false' }
 
@@ -96,7 +97,7 @@ $xml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Curation of marked McTrader sentiment files (SYMBOL.pending.json -&gt; SYMBOL.json) with the local model at 127.0.0.1:8080. Runs only while McTrader's API answers /openapi.json; exits silently otherwise.</Description>
+    <Description>Curation of marked McTrader sentiment files (SYMBOL.new.json -&gt; SYMBOL.json) with the local llama.cpp model at 127.0.0.1:8080. Runs only while McTrader's API answers /openapi.json; exits silently otherwise.</Description>
     <URI>\$TaskName</URI>
   </RegistrationInfo>
   <Triggers>
@@ -152,7 +153,7 @@ Write-Output "Next run: $($info.NextRunTime)"
 Write-Output "Inspect : powershell -ExecutionPolicy Bypass -File $PSCommandPath -Show"
 if ($taskEnabled -eq 'false') {
     Write-Output ""
-    Write-Output "NOT RUNNING: $marked file(s) are already marked pending in $SentimentDir,"
+    Write-Output "NOT RUNNING: $marked file(s) are already marked (.new.json) in $SentimentDir,"
     Write-Output "so enabling the task would start curating them now (articles trimmed,"
     Write-Output "files renamed to *.json). Nothing has been touched."
     Write-Output "A byte-identical copy of the queue is in $WorkDir\state\backup-before-first-run."

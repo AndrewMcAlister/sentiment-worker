@@ -1,7 +1,7 @@
 """Every fact the worker is allowed to assume, in one place.
 
-The two values an operator is most likely to need to change are here and only
-here: :data:`PENDING_SUFFIX` (the marker convention) and :data:`SENTIMENT_DIR`
+The values an operator is most likely to need to change are here and only here:
+the state constants below (the marker convention) and :data:`SENTIMENT_DIR`
 (where the files live).  Everything else is a cap or a timeout that was chosen
 from a measurement, and the measurement is in the comment beside it.
 """
@@ -18,10 +18,10 @@ from pathlib import Path
 # Windows filename, so the marker is carried in the stem instead:
 #
 #     BAC.json           finished, nothing to do
-#     BAC.pending.json   articles appended, needs processing
+#     BAC.new.json       articles appended, needs processing
 #
-# To change the convention, change these two constants and the one README line
-# that names them.  `LOGICAL_SUFFIX` must be the suffix a finished file carries;
+# To change the convention, change these three state constants and the one README line
+# that names them.  `FINISHED_STATE` also becomes the suffix a finished file carries;
 # it is what `finished_name` strips back to.
 # Names are <symbol>.<country>.<state>.json, separated by dots:
 #
@@ -54,9 +54,12 @@ STOP_GRACE_S = 30.0
 
 # Derived from the three states rather than written out again: the parts are the single
 # source, and these are the spellings the rest of the code compares against. Keeping them
-# as names means a call site reads `.pending.json` without repeating a literal.
+# as names means a call site reads `.new.json` without repeating a literal.
+#:
+#: ".pending.json": the collector is still appending; this worker never reads it.
 WRITING_SUFFIX = SEPARATOR + WRITING_STATE + SEPARATOR + FINISHED_STATE
-PENDING_SUFFIX = SEPARATOR + PENDING_STATE + SEPARATOR + FINISHED_STATE          # processed
+#: ".new.json": complete and waiting for this worker - the only suffix it processes.
+PENDING_SUFFIX = SEPARATOR + PENDING_STATE + SEPARATOR + FINISHED_STATE
 
 # ── paths ────────────────────────────────────────────────────────────────────
 
@@ -75,36 +78,20 @@ FAILURES_PATH = STATE_DIR / "failures.json"
 MCTRADER_OPENAPI = "http://127.0.0.1:8000/openapi.json"
 MCTRADER_TIMEOUT_SECONDS = 3.0
 
-#: Strata, the local model server.  The chat endpoint is the one that matters;
-#: `/v1/models` is the cheap liveness probe and also names the loaded model.
-STRATA_BASE = "http://127.0.0.1:8080"
-STRATA_MODELS_URL = STRATA_BASE + "/v1/models"
-STRATA_CHAT_URL = STRATA_BASE + "/v1/chat/completions"
-STRATA_MODELS_TIMEOUT_SECONDS = 5.0
+#: llama.cpp's server (`llama-server`) and its router.  The chat endpoint is the
+#: one that matters; `/v1/models` is the cheap liveness probe and also names the
+#: preset the router currently has loaded.  A request MUST name a model - the
+#: router rejects one without it - so the client reads that probe every pass.
+LLAMA_BASE = "http://127.0.0.1:8080"
+LLAMA_MODELS_URL = LLAMA_BASE + "/v1/models"
+LLAMA_CHAT_URL = LLAMA_BASE + "/v1/chat/completions"
+LLAMA_MODELS_TIMEOUT_SECONDS = 5.0
 
-#: 8080 is bound only after the model is in VRAM (40 s warm, minutes cold), so "nothing
-#: is listening" is also true of a Strata that is 20 s into a load.  A starter says so by
-#: dropping this flag before it loads; a fresh flag means wait for the port, not start a
-#: second 15 GB model on the same card.  The same file is written by Strata's service and
-#: by its `Strata-EnsureRunning` task - see sentiment-worker/strata.py: ensure().
-STRATA_HOST = "127.0.0.1"
-STRATA_PORT = 8080
-STRATA_STARTING_FLAG = os.environ.get(
-    "STRATA_STARTING_FLAG", r"C:\ProgramData\Strata\strata.starting"
-)
-#: A flag this old is debris from a crash rather than a load in progress.
-STRATA_STARTING_FLAG_SECONDS = 300.0
-#: How long to wait for a starting Strata to bind, and how often to look.
-STRATA_LOAD_WAIT_SECONDS = 300.0
-STRATA_LOAD_POLL_SECONDS = 15.0
-
-#: The client this worker calls is `D:\news-sentiment\sentiment.py` — the
-#: measured one, with the `enable_thinking: false` request and the null-content
-#: check.  It is imported, never copied: a second client would drift from the
-#: settings that were measured against the running engine.
-SENTIMENT_CLIENT_DIR = Path(
-    os.environ.get("SENTIMENT_CLIENT_DIR", r"D:\news-sentiment")
-)
+#: Normally empty: the loaded preset reported by the router is what the worker
+#: uses, so the name in the file is the model that actually answered.  Set
+#: `SENTIMENT_LLAMA_MODEL` only to name the preset a request should autoload
+#: when the router has nothing loaded; a request cannot be sent without a name.
+LLAMA_MODEL = os.environ.get("SENTIMENT_LLAMA_MODEL", "").strip()
 
 # ── the curation rules ───────────────────────────────────────────────────────
 
@@ -133,7 +120,7 @@ MIN_SCORED_FRACTION = 0.5
 
 #: Characters kept from an article's text when it is sent to the model.  The
 #: prompt is one article, so this only bounds a pathological summary; 900 chars
-#: is ~230 tokens, well inside the engine's context and its 2 s budget.
+#: is ~230 tokens, well inside the engine's context.
 MAX_ARTICLE_CHARS = 900
 MAX_TITLE_CHARS = 300
 
@@ -149,12 +136,10 @@ MAX_EVIDENCE_PHRASE_CHARS = 200
 #: holding the lock forever.
 MAX_FILES_PER_RUN = 200
 
-#: Per-request ceiling handed to the shared client.  Cold requests were measured
-#: at ~10 s and warm at ~0.35 s; a minute was a wide margin on an idle model.
-#: It is not wide when the model is busy: the worker and a person's chat share
-#: one engine, and a request that queues behind a 20 s prompt (or behind a
-#: conversation that is mid-answer) passed 60 s on 2026-11-11 and aborted the
-#: whole pass, which is what kept the backlog from draining.  Three minutes still
+#: Per-request ceiling handed to the client.  The loaded Qwen3-Next-80B
+#: measured 8.1 s for a 118-token prompt on 2026-11-24 (prefill 15.5 tok/s,
+#: generation 18.2 tok/s), so a 900-character article is roughly 20 s; a request
+#: can also queue behind another user of the shared engine.  Three minutes still
 #: ends a genuinely hung connection, and a timeout costs a whole pass.
 REQUEST_TIMEOUT_SECONDS = 180.0
 

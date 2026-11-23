@@ -6,11 +6,11 @@ The invariants this module exists to keep:
   temporary file in the same directory, is fsynced, is parsed back and validated
   from disk, and is only then renamed over its target.
 * **The marker clears last.**  On success the new payload is written *through*
-  the pending name (``BAC.pending.json``) and only then renamed to
-  ``BAC.json``.  The pending file is never deleted, so if the process dies there
-  is always a complete file under one of the two names.
+  the marked name (``BAC.new.json``) and only then renamed to ``BAC.json``.  The
+  marked file is never deleted, so if the process dies there is always a complete
+  file under one of the two names.
 * **A file that changed while it was being read is not overwritten.**  The
-  pending file's size and modification time are compared immediately before the
+  marked file's size and modification time are compared immediately before the
   first rename; a mismatch abandons the file for this run rather than clobbering
   an append that arrived mid-judgement.
 * **The lock never outlives the process.**  It is a byte-range lock held on an

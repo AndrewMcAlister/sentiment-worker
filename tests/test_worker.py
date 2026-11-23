@@ -11,10 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import subprocess
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,7 +25,7 @@ import relevance
 import service
 import sentiment_worker
 import store
-import strata
+import llama_client
 import validate
 
 TESTS = Path(__file__).resolve().parent
@@ -111,7 +109,7 @@ def sandbox(tmp_path, monkeypatch):
 
 
 def fake_model(score_for=lambda title: 5.0, model: str = "test-model"):
-    """A deterministic stand-in for Strata: no HTTP, same contract."""
+    """A deterministic stand-in for llama-server: no HTTP, same contract."""
 
     def score_article(article, *, model=model, timeout=None):
         return {
@@ -339,7 +337,7 @@ def test_reading_updates_only_the_local_fields():
     assert local["label"] == "Local — test-model"
     assert local["score"] == 4.5
     assert local["status"] == "ok"
-    assert local["basis"] == "strata_local"
+    assert local["basis"] == "llama_local"
     assert local["as_of"] == "2026-10-19"
     assert len(local["reason"].split()) > 20, "the reason should be a paragraph"
     assert len(local["evidence"]) <= config.MAX_EVIDENCE_LINES
@@ -498,12 +496,12 @@ def test_lock_does_not_survive_a_crash(tmp_path):
 def test_a_failing_file_is_left_as_failed_unchanged(sandbox, monkeypatch):
     pending = make_pending("BAC.json", sandbox.data)
     before = digest(pending)
-    monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
+    monkeypatch.setattr(llama_client, "model_name", lambda timeout=None: "test-model")
 
     def broken(article, *, model, timeout=None):
-        raise strata.StrataError("no content in the reply; the model reasoned instead")
+        raise llama_client.LlamaError("no content in the reply; the model reasoned instead")
 
-    monkeypatch.setattr(strata, "score_article", broken)
+    monkeypatch.setattr(llama_client, "score_article", broken)
 
     code = sentiment_worker.run(directory=sandbox.data, force=True)
 
@@ -526,8 +524,8 @@ def test_a_corrupt_marked_file_is_left_as_failed(sandbox, monkeypatch):
     pending = sandbox.data / "BAC.us.new.json"
     pending.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     before = digest(pending)
-    monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
-    monkeypatch.setattr(strata, "score_article", fake_model())
+    monkeypatch.setattr(llama_client, "model_name", lambda timeout=None: "test-model")
+    monkeypatch.setattr(llama_client, "score_article", fake_model())
 
     code = sentiment_worker.run(directory=sandbox.data, force=True)
 
@@ -548,8 +546,8 @@ def test_full_pass_finishes_every_marked_file(sandbox, monkeypatch):
     make_pending("ADBE.json", sandbox.data)  # no articles at all
     pending = sorted(sandbox.data.glob("*.us.new.json"))
 
-    monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
-    monkeypatch.setattr(strata, "score_article", fake_model(lambda title: 4.0))
+    monkeypatch.setattr(llama_client, "model_name", lambda timeout=None: "test-model")
+    monkeypatch.setattr(llama_client, "score_article", fake_model(lambda title: 4.0))
 
     code = sentiment_worker.run(directory=sandbox.data, force=True)
 
@@ -584,8 +582,8 @@ def test_full_pass_finishes_every_marked_file(sandbox, monkeypatch):
 def test_dry_run_writes_nothing(sandbox, monkeypatch):
     pending = make_pending("BAC.json", sandbox.data)
     before = digest(pending)
-    monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
-    monkeypatch.setattr(strata, "score_article", fake_model())
+    monkeypatch.setattr(llama_client, "model_name", lambda timeout=None: "test-model")
+    monkeypatch.setattr(llama_client, "score_article", fake_model())
 
     code = sentiment_worker.run(directory=sandbox.data, force=True, dry_run=True)
 
@@ -606,37 +604,66 @@ def test_a_pass_with_no_files_still_says_it_polled(sandbox):
 def test_mctrader_down_does_nothing_at_all(sandbox, monkeypatch):
     make_pending("BAC.json", sandbox.data)
     monkeypatch.setattr(sentiment_worker, "mctrader_is_up", lambda timeout=None: False)
-    monkeypatch.setattr(strata, "score_article", fake_model())
+    monkeypatch.setattr(llama_client, "score_article", fake_model())
 
     assert sentiment_worker.run(directory=sandbox.data) == sentiment_worker.EXIT_OK
     assert not list(sandbox.logs.glob("*.log")), "a down API must not write a log line"
     assert (sandbox.data / "BAC.us.new.json").exists()
 
 
-def test_strata_down_queues_the_files_and_says_so_once(sandbox, monkeypatch):
+def test_llama_down_queues_the_files_and_says_so_once(sandbox, monkeypatch):
     pending = make_pending("BAC.json", sandbox.data)
     before = digest(pending)
 
     def down(timeout=None):
-        raise strata.StrataDown("connection refused")
+        raise llama_client.LlamaDown("connection refused")
 
-    monkeypatch.setattr(strata, "model_name", down)
+    monkeypatch.setattr(llama_client, "model_name", down)
 
     assert sentiment_worker.run(directory=sandbox.data, force=True) == sentiment_worker.EXIT_OK
-    assert digest(pending) == before, "a down Strata must not touch a marked file"
-    notices = [line for line in log_lines(sandbox) if "strata_unavailable" in line]
+    assert digest(pending) == before, "a down llama-server must not touch a marked file"
+    notices = [line for line in log_lines(sandbox) if "llama_unavailable" in line]
     assert len(notices) == 1
     assert "pending=1" in notices[0]
 
     # The notice is throttled: a second tick within the hour adds no second one.
     assert sentiment_worker.run(directory=sandbox.data, force=True) == sentiment_worker.EXIT_OK
-    assert len([l for l in log_lines(sandbox) if "strata_unavailable" in l]) == 1
+    assert len([l for l in log_lines(sandbox) if "llama_unavailable" in l]) == 1
+
+
+def test_a_llama_that_dies_mid_file_aborts_the_whole_pass(sandbox, monkeypatch):
+    """A server that stopped answering will fail every remaining article too.
+
+    The file in flight keeps its bytes, the files behind it are never started,
+    and the failure is not recorded as a bad file: it is a pass-level abort.
+    """
+    first = make_pending("BAC.json", sandbox.data)
+    second = make_pending("ABBV.json", sandbox.data)
+    before_first = digest(first)
+    before_second = digest(second)
+    monkeypatch.setattr(llama_client, "model_name", lambda timeout=None: "test-model")
+
+    def dies(article, *, model, timeout=None):
+        raise llama_client.LlamaDown("connection reset")
+
+    monkeypatch.setattr(llama_client, "score_article", dies)
+
+    code = sentiment_worker.run(directory=sandbox.data, force=True)
+
+    assert code == sentiment_worker.EXIT_OK, "a down server is not a failed file"
+    assert digest(first) == before_first, "the file in flight must keep its bytes"
+    assert digest(second) == before_second, "a file behind it must not be started"
+    assert not list(sandbox.data.glob("*.Failed.json"))
+    lines = log_lines(sandbox)
+    assert any("aborted" in line and "llama-server stopped answering" in line for line in lines), lines
+    assert any("llama_unavailable" in line for line in lines), lines
+    assert not any(" FAILED " in line for line in lines), lines
 
 
 def test_a_second_instance_stands_down(sandbox, monkeypatch):
     make_pending("BAC.json", sandbox.data)
-    monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
-    monkeypatch.setattr(strata, "score_article", fake_model())
+    monkeypatch.setattr(llama_client, "model_name", lambda timeout=None: "test-model")
+    monkeypatch.setattr(llama_client, "score_article", fake_model())
 
     with store.instance_lock(sandbox.state / "worker.lock"):
         code = sentiment_worker.run(directory=sandbox.data, force=True)
@@ -689,144 +716,6 @@ def test_australian_files_are_scored_before_american_ones(sandbox):
     listed = [p.name for p in store.discover(sandbox.data)]
     assert listed[0].endswith(".au.new.json"), listed
     assert listed[-1].endswith(".uk.new.json"), listed
-
-class TestStrataGate:
-    """``strata.ensure``: use what is there, wait for what is starting, start only when idle.
-
-    The clock and the sleep are injected, so the whole ladder runs in microseconds and the
-    post-start wait does not actually sleep for five minutes.
-    """
-
-    class Clock:
-        def __init__(self) -> None:
-            self.now = 0.0
-            self.slept: list = []
-
-        def clock(self) -> float:
-            return self.now
-
-        def sleep(self, seconds: float) -> None:
-            self.slept.append(seconds)
-            self.now += seconds
-
-    @staticmethod
-    def flag(tmp_path, age_seconds: float):
-        path = tmp_path / "strata.starting"
-        path.write_text('{"pid": 1}', encoding="utf-8")
-        if age_seconds:
-            stamp = time.time() - age_seconds
-            os.utime(path, (stamp, stamp))
-        return path
-
-    def _gate(self, listen, *, start=None, monkeypatch=None, flag_path=None):
-        clock = self.Clock()
-        return strata.ensure(
-            listen=listen,
-            start=start or (lambda: None),
-            sleep=clock.sleep,
-            clock=clock.clock,
-        ), clock
-
-    def test_a_listening_strata_is_used_and_nothing_is_started(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(config, "STRATA_STARTING_FLAG", str(tmp_path / "absent"))
-        started = []
-        outcome, clock = self._gate(lambda: True, start=lambda: started.append(1))
-
-        assert outcome["action"] == "in-use"
-        assert started == []
-        assert clock.slept == []
-
-    def test_a_fresh_flag_is_waited_for_rather_than_competed_with(self, tmp_path, monkeypatch):
-        # The port answers on the second look: the first is the top-of-gate probe, the second
-        # is after one wait. The flag stays fresh throughout, so nothing may start.
-        monkeypatch.setattr(config, "STRATA_STARTING_FLAG", str(self.flag(tmp_path, 5)))
-        looks = {"count": 0}
-        started = []
-
-        def listen() -> bool:
-            looks["count"] += 1
-            return looks["count"] >= 2
-
-        outcome, clock = self._gate(listen, start=lambda: started.append(1))
-
-        assert outcome["action"] == "waited"
-        assert started == [], "a waiting gate must never start a second Strata"
-        assert len(clock.slept) == 1
-
-    def test_the_wait_ends_when_the_flag_goes_and_nothing_answers(self, tmp_path, monkeypatch):
-        # A starter that crashed: the flag is deleted, the port never answers during the wait,
-        # so the gate stops waiting and starts the service.
-        flag = self.flag(tmp_path, 5)
-        monkeypatch.setattr(config, "STRATA_STARTING_FLAG", str(flag))
-        state = {"up": False}
-        started = []
-
-        def start() -> None:
-            started.append(1)
-            state["up"] = True
-
-        clock = self.Clock()
-
-        def sleep(seconds: float) -> None:
-            clock.sleep(seconds)
-            flag.unlink(missing_ok=True)
-
-        outcome = strata.ensure(
-            listen=lambda: state["up"],
-            start=start,
-            sleep=sleep,
-            clock=clock.clock,
-        )
-
-        assert started, "nothing was starting, so the gate should have started one"
-        assert outcome["action"] == "started"
-
-    def test_a_stale_flag_is_not_waited_for(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            config,
-            "STRATA_STARTING_FLAG",
-            str(self.flag(tmp_path, config.STRATA_STARTING_FLAG_SECONDS + 60)),
-        )
-        state = {"up": False}
-
-        def start() -> None:
-            state["up"] = True
-
-        outcome, clock = self._gate(lambda: state["up"], start=start)
-
-        assert outcome["action"] == "started"
-
-    def test_no_flag_and_no_port_starts_the_service(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(config, "STRATA_STARTING_FLAG", str(tmp_path / "absent"))
-        state = {"up": False}
-
-        def start() -> dict:
-            state["up"] = True
-            return {"state": "running"}
-
-        outcome, _ = self._gate(lambda: state["up"], start=start)
-
-        assert outcome["action"] == "started"
-
-    def test_a_start_that_never_binds_is_reported_not_hidden(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(config, "STRATA_STARTING_FLAG", str(tmp_path / "absent"))
-        outcome, clock = self._gate(lambda: False)
-
-        assert outcome["action"] == "start-timeout"
-        assert len(clock.slept) == int(
-            config.STRATA_LOAD_WAIT_SECONDS / config.STRATA_LOAD_POLL_SECONDS
-        )
-
-    def test_a_start_that_raises_is_reported_as_failed(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(config, "STRATA_STARTING_FLAG", str(tmp_path / "absent"))
-
-        def start() -> None:
-            raise RuntimeError("the service refused to start")
-
-        outcome, _ = self._gate(lambda: False, start=start)
-
-        assert outcome["action"] == "start-failed"
-        assert "refused" in outcome["detail"]
 
 class TestFreshWork:
     """Pending is work. A file that cannot be processed leaves the queue by being renamed."""
@@ -888,36 +777,6 @@ class TestFreshWork:
 
         assert fresh == [path]
 
-class TestFreshWorkAtServiceLevel:
-    """The loop's own view: an empty queue is never fresh work."""
-
-    @staticmethod
-    def supervisor():
-        return service.Supervisor("SentimentWorker", 120.0)
-
-    def test_an_empty_queue_is_not_fresh_work(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(config, "SENTIMENT_DIR", tmp_path)
-
-        assert self.supervisor()._fresh_work(object()) is False
-
-    def test_a_new_pending_file_is_fresh_work(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(config, "SENTIMENT_DIR", tmp_path)
-        pending = tmp_path / "AAA.us.new.json"
-        pending.write_text("{}", encoding="utf-8")
-        queued = [pending]
-
-        class Worker:
-            @staticmethod
-            def fresh_work(candidates, failures):
-                return queued
-
-            class store:
-                @staticmethod
-                def load_failures():
-                    return {}
-
-        assert self.supervisor()._fresh_work(Worker) is True
-
 class TestFailedNaming:
     """A file that cannot be processed is left as <Symbol>.<market>.Failed.json."""
 
@@ -947,43 +806,6 @@ class TestFailedNaming:
         # Lost between discovery and the failure: the pass must survive it.
         sentiment_worker.mark_failed(tmp_path / "GONE.us.new.json", "nope", log_dir=tmp_path)
 
-class TestGateHonoursStop:
-    """A service stop must not wait out the gate's 180 s port wait."""
-
-    class Clock:
-        def __init__(self) -> None:
-            self.now = 0.0
-
-        def clock(self) -> float:
-            return self.now
-
-        def sleep(self, seconds: float) -> None:
-            self.now += seconds
-
-    def test_a_stop_request_ends_the_wait(self, tmp_path, monkeypatch):
-        flag = tmp_path / "strata.starting"
-        flag.write_text('{"pid": 1}', encoding="utf-8")
-        monkeypatch.setattr(config, "STRATA_STARTING_FLAG", str(flag))
-        clock = self.Clock()
-        started = []
-        looks = {"count": 0}
-
-        def listen() -> bool:
-            looks["count"] += 1
-            return False  # nothing ever binds
-
-        outcome = strata.ensure(
-            listen=listen,
-            start=lambda: started.append(1),
-            sleep=clock.sleep,
-            clock=clock.clock,
-            should_stop=lambda: looks["count"] >= 2,
-        )
-
-        assert outcome["action"] == "stopped"
-        assert started == [], "a stop must not leave a start behind"
-        assert clock.now < config.STRATA_LOAD_WAIT_SECONDS, "it should not wait the full window"
-
 class TestStopMidFile:
     """A stop gives the file in flight a grace window, then abandons what is left of it."""
 
@@ -991,8 +813,8 @@ class TestStopMidFile:
         # The common case: the file is a few articles from done, so stopping would throw the
         # scoring away. The grace lets it land, and only then does the pass end.
         pending = make_pending("BAC.json", sandbox.data)
-        monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
-        monkeypatch.setattr(strata, "score_article", fake_model())
+        monkeypatch.setattr(llama_client, "model_name", lambda timeout=None: "test-model")
+        monkeypatch.setattr(llama_client, "score_article", fake_model())
 
         outcome = sentiment_worker.process_file(
             pending,
@@ -1009,8 +831,8 @@ class TestStopMidFile:
     def test_a_file_that_outlasts_the_grace_is_abandoned(self, sandbox, monkeypatch):
         pending = make_pending("BAC.json", sandbox.data)
         before = digest(pending)
-        monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
-        monkeypatch.setattr(strata, "score_article", fake_model())
+        monkeypatch.setattr(llama_client, "model_name", lambda timeout=None: "test-model")
+        monkeypatch.setattr(llama_client, "score_article", fake_model())
         monkeypatch.setattr(config, "STOP_GRACE_S", 0.0)   # the grace has run out
 
         with pytest.raises(sentiment_worker.FileStopped):
@@ -1027,8 +849,8 @@ class TestStopMidFile:
 
     def test_a_stop_mid_pass_abandons_the_file_and_ends_the_pass(self, sandbox, monkeypatch):
         pending = make_pending("BAC.json", sandbox.data)
-        monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
-        monkeypatch.setattr(strata, "score_article", fake_model())
+        monkeypatch.setattr(llama_client, "model_name", lambda timeout=None: "test-model")
+        monkeypatch.setattr(llama_client, "score_article", fake_model())
         monkeypatch.setattr(config, "STOP_GRACE_S", 0.0)
         checks = {"count": 0}
 
@@ -1052,8 +874,8 @@ class TestStaleLocalReading:
         payload["local_sentiment_status"] = "ok"
         pending = sandbox.data / "BAC.us.new.json"
         pending.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        monkeypatch.setattr(strata, "model_name", lambda timeout=None: "test-model")
-        monkeypatch.setattr(strata, "score_article", fake_model())
+        monkeypatch.setattr(llama_client, "model_name", lambda timeout=None: "test-model")
+        monkeypatch.setattr(llama_client, "score_article", fake_model())
 
         code = sentiment_worker.run(directory=sandbox.data, force=True)
 

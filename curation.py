@@ -525,7 +525,9 @@ def apply_reading(
     entry["score"] = reading.score
     entry["scale"] = "1-10"
     entry["status"] = reading.status
-    entry["basis"] = "strata_local"
+    # Provenance is data, not a backend switch: files curated before the llama.cpp
+    # swap still say "strata_local", and nothing in McTrader compares this value.
+    entry["basis"] = "llama_local"
     entry["as_of"] = reading.as_of
     entry["reason"] = reading.reason
     entry["evidence"] = list(reading.evidence)

@@ -1,26 +1,30 @@
 """The sentiment curator: finish marked files while McTrader is running.
 
-A file marked ``<SYMBOL>.pending.json`` has articles that still need reading.
+A file marked ``<SYMBOL>.new.json`` has articles that still need reading.
 For each one this worker:
 
 1. drops every article older than three months and every article that is not
    clearly about the symbol (see :mod:`relevance`);
-2. scores the newest fifteen survivors, one request at a time, with the local
-   model at ``127.0.0.1:8080`` (see :mod:`strata`);
+2. scores the newest fifteen survivors, one request at a time, with the model
+   ``llama-server`` reports as loaded at ``127.0.0.1:8080`` (see
+   :mod:`llama_client`);
 3. writes the mean, a checkable reason and up to ten evidence lines into the
    file's ``scores[local]`` entry — leaving the production reading alone;
 4. validates the finished payload against ``schema.json`` and renames the
    marked file to its unmarked name (see :mod:`store`).
 
-It is meant to run from a five-minute scheduled task.  Two behaviours follow
-from that:
+It normally runs inside the ``SentimentWorker`` Windows service; the
+five-minute scheduled task is an alternative.  Two behaviours follow from
+running unattended:
 
-* **Nothing is logged when there is nothing to do.**  McTrader being down, or no
-  marked files, exits silently — at twelve ticks an hour a chatty worker would
-  bury its own useful lines.
-* **One file is one transaction.**  A failed file is left exactly as it was:
-  never deleted, never half-written, never renamed, and recorded in
-  ``state/failures.json`` so it is visible without reading a log.
+* **A pass with nothing to do is one line.**  McTrader being down ends the pass
+  before any queue file is written; otherwise every pass records
+  ``poll files=N`` — the heartbeat that tells an idle worker from a dead one.
+* **One file is one transaction.**  A file that fails during processing is
+  never deleted, half-written or rewritten: a validation or too-thin failure
+  renames its bytes to the ``Failed`` state (and records it in
+  ``state/failures.json``), while a server-down abort leaves it marked for the
+  next pass.  Renaming a ``Failed`` file back is the explicit retry.
 
 Run it by hand:
 
@@ -46,8 +50,8 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 import config
 import curation
+import llama_client
 import store
-import strata
 import validate
 
 EXIT_OK = 0
@@ -71,11 +75,11 @@ def mctrader_is_up(timeout: float = config.MCTRADER_TIMEOUT_SECONDS) -> bool:
         return False
 
 
-def strata_is_up() -> Tuple[bool, str]:
-    """``(up, model_or_error)`` — the model id is the liveness proof."""
+def llama_is_up() -> Tuple[bool, str]:
+    """``(up, model_or_error)`` — the loaded model id is the liveness proof."""
     try:
-        return True, strata.model_name()
-    except strata.StrataError as exc:
+        return True, llama_client.model_name()
+    except llama_client.LlamaError as exc:
         return False, str(exc)
 
 
@@ -162,8 +166,9 @@ def process_file(
 ) -> Outcome:
     """Trim, score and commit one marked file.
 
-    Raises :class:`strata.StrataDown` when the server itself stops answering —
-    the caller abandons the run rather than paying the same timeout per file.
+    Raises :class:`llama_client.LlamaDown` when the server itself stops
+    answering — the caller abandons the run rather than paying the same timeout
+    per file.
     Every other failure comes back as an ``Outcome`` with ``ok=False`` and the
     marked file untouched.
     """
@@ -224,10 +229,10 @@ def process_file(
                 if time.monotonic() - stop_seen_at >= config.STOP_GRACE_S:
                     raise FileStopped(name)
             try:
-                verdict = strata.score_article(article, model=model)
-            except strata.StrataDown:
+                verdict = llama_client.score_article(article, model=model)
+            except llama_client.LlamaDown:
                 raise
-            except strata.StrataError as exc:
+            except llama_client.LlamaError as exc:
                 failures.append((str(article.get("title") or "")[:120], str(exc)))
                 if verbose and sys.stderr is not None:
                     print(f"  [{position}/{len(targets)}] FAILED {exc}", file=sys.stderr)
@@ -235,7 +240,7 @@ def process_file(
             verdicts[int(article.get("index") or 0)] = verdict
             if verbose and sys.stderr is not None:
                 print(
-                    f"  [{position}/{len(targets)}] {strata.describe(article, verdict)}",
+                    f"  [{position}/{len(targets)}] {llama_client.describe(article, verdict)}",
                     file=sys.stderr,
                 )
 
@@ -326,7 +331,7 @@ def process_file(
         _log_outcome(outcome, log_dir=log_dir)
         return outcome
 
-    except strata.StrataDown:
+    except llama_client.LlamaDown:
         raise
     except (FileFailed, store.StoreError, validate.SchemaError) as exc:
         outcome.error = str(exc)
@@ -345,8 +350,8 @@ def process_file(
 # ── the run ──────────────────────────────────────────────────────────────────
 
 
-def _note_strata_down(count: int, error: str, *, log_dir: Optional[Path]) -> None:
-    """Say "Strata is down, N files are queued" at most once an hour.
+def _note_llama_down(count: int, error: str, *, log_dir: Optional[Path]) -> None:
+    """Say "llama-server is down, N files are queued" at most once an hour.
 
     The files are not touched and not consumed: they stay marked and the next
     tick tries again.  Logging that every five minutes would bury the log, so
@@ -354,7 +359,7 @@ def _note_strata_down(count: int, error: str, *, log_dir: Optional[Path]) -> Non
     """
     moment = store.now_utc()
     try:
-        previous = json.loads((config.STATE_DIR / "strata_down.json").read_text(encoding="utf-8"))
+        previous = json.loads((config.STATE_DIR / "llama_down.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         previous = {}
     last = previous.get("last_notice_utc") if isinstance(previous, dict) else None
@@ -369,13 +374,13 @@ def _note_strata_down(count: int, error: str, *, log_dir: Optional[Path]) -> Non
     if not due:
         return
     store.append_log(
-        f"{store.iso(moment)} strata_unavailable pending={count} "
+        f"{store.iso(moment)} llama_unavailable pending={count} "
         f"error={json.dumps(error)} note=files_queued_untouched",
         log_dir=log_dir,
     )
     try:
         store.dump_json(
-            config.STATE_DIR / "strata_down.json",
+            config.STATE_DIR / "llama_down.json",
             {"last_notice_utc": store.iso(moment), "pending": count, "error": error},
         )
     except OSError:
@@ -392,12 +397,12 @@ def run(
     verbose: bool = False,
     log_dir: Optional[Path] = None,
     should_stop: Optional[Callable[[], bool]] = None,
-    ensure_strata: Optional[Callable[[], object]] = None,
 ) -> int:
     """One pass.  Returns the process exit code.
 
-    Silence is the default: no McTrader, no marked files, or another run in
-    progress all end the pass with no output at all.
+    No McTrader ends the pass before anything is written.  Once that gate
+    passes, every pass records a ``poll files=N`` heartbeat; no marked files,
+    or another run holding the lock, then ends it without touching a file.
     """
     if not force and not mctrader_is_up():
         return EXIT_OK
@@ -433,7 +438,6 @@ def run(
                 verbose=verbose,
                 log_dir=log_dir,
                 should_stop=should_stop,
-                ensure_strata=ensure_strata,
             )
     except store.LockBusy:
         # Another tick is working.  That is the guard doing its job, not an
@@ -481,23 +485,17 @@ def mark_failed(path: Path, error: str, *, log_dir: Optional[Path] = None) -> No
     )
 
 
-def _run_locked(    candidates: Sequence[Path],
+def _run_locked(
+    candidates: Sequence[Path],
     *,
     dry_run: bool,
     verbose: bool,
     log_dir: Optional[Path],
     should_stop: Optional[Callable[[], bool]] = None,
-    ensure_strata: Optional[Callable[[], object]] = None,
 ) -> int:
-    up, detail = strata_is_up()
-    if not up and ensure_strata is not None and fresh_work(candidates, store.load_failures()):
-        # "Nothing listening" is not "nothing starting": the gate waits for a Strata that is
-        # loading and only starts the service when nothing is happening at all.  Injected by
-        # the service wrapper, the one caller that may start a service.
-        ensure_strata()
-        up, detail = strata_is_up()
+    up, detail = llama_is_up()
     if not up:
-        _note_strata_down(len(candidates), detail, log_dir=log_dir)
+        _note_llama_down(len(candidates), detail, log_dir=log_dir)
         return EXIT_OK
 
     model = detail
@@ -537,13 +535,13 @@ def _run_locked(    candidates: Sequence[Path],
                 log_dir=log_dir,
             )
             break
-        except strata.StrataDown as exc:
+        except llama_client.LlamaDown as exc:
             store.append_log(
-                f"{store.iso(store.now_utc())} aborted reason={json.dumps(f'strata stopped answering: {exc}')} "
+                f"{store.iso(store.now_utc())} aborted reason={json.dumps(f'llama-server stopped answering: {exc}')} "
                 f"remaining={len(candidates)}",
                 log_dir=log_dir,
             )
-            _note_strata_down(len(candidates), str(exc), log_dir=log_dir)
+            _note_llama_down(len(candidates), str(exc), log_dir=log_dir)
             break
         except store.StoreError as exc:
             store.append_log(
@@ -579,7 +577,7 @@ def check(directory: Optional[Path] = None) -> int:
     """Print what the gates see.  Reads nothing and changes nothing."""
     directory = Path(directory or config.SENTIMENT_DIR)
     api = mctrader_is_up()
-    up, detail = strata_is_up()
+    up, detail = llama_is_up()
     try:
         marked = store.discover(directory)
         listing = f"{len(marked)} marked file(s) in {directory}"
@@ -593,7 +591,7 @@ def check(directory: Optional[Path] = None) -> int:
         except (OSError, ValueError):
             lock_state = "file present, unreadable"
     print(f"mcTrader  : {'up' if api else 'DOWN'} ({config.MCTRADER_OPENAPI})")
-    print(f"strata    : {'up, model ' + detail if up else 'DOWN: ' + detail}")
+    print(f"llama.cpp : {'up, model ' + detail if up else 'DOWN: ' + detail}")
     print(f"pending   : {listing}")
     print(f"lock      : {lock_state}")
     print(f"marker    : <symbol>.<cc>{config.PENDING_SUFFIX} (config.PENDING_SUFFIX)")

@@ -130,7 +130,7 @@
           },
           "basis": {
             "type": "string",
-            "description": "Where the reading came from: 'deepseek_search' / 'ibkr_news' for production, 'strata_local' for the local reading."
+            "description": "Where the reading came from: 'deepseek_search' / 'ibkr_news' for production, and 'llama_local' for a reading from the local llama.cpp server. Historical files curated before that server replaced Strata keep 'strata_local'."
           },
           "as_of": {
             "type": "string"
